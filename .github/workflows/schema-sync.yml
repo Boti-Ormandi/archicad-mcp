@@ -1,0 +1,62 @@
+name: Schema Sync
+
+on:
+  pull_request_target:
+    paths:
+      - '.gitmodules'
+      - 'deps/**'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-schemas:
+    # Only run on Renovate PRs to avoid security risks with pull_request_target
+    if: github.event.pull_request.user.login == 'renovate[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          submodules: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install sync tool
+        run: pip install -e .
+
+      - name: Detect which submodule changed
+        id: detect
+        run: |
+          git diff origin/${{ github.event.pull_request.base.ref }} -- deps/tapir && echo "tapir=true" >> "$GITHUB_OUTPUT" || true
+          git diff origin/${{ github.event.pull_request.base.ref }} -- deps/multiconn && echo "multiconn=true" >> "$GITHUB_OUTPUT" || true
+
+      - name: Run schema sync (tapir)
+        if: steps.detect.outputs.tapir == 'true'
+        run: archicad-mcp-sync deps/tapir
+
+      - name: Run schema sync (builtin)
+        if: steps.detect.outputs.multiconn == 'true'
+        run: archicad-mcp-sync deps/multiconn
+
+      - name: Run tests on regenerated schemas
+        run: |
+          pip install -e ".[dev]"
+          pytest tests/unit/test_schema_cache.py -x -q
+
+      - name: Check for changes
+        id: diff
+        run: |
+          git diff --quiet src/archicad_mcp/schemas/ || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit updated schemas
+        if: steps.diff.outputs.changed == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "sync schemas from upstream"
+          file_pattern: "src/archicad_mcp/schemas/*.json"

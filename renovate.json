@@ -1,0 +1,21 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "git-submodules": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "matchManagers": ["git-submodules"],
+      "matchPackageNames": ["ENZYME-APD/tapir-archicad-automation"],
+      "groupName": "tapir schemas",
+      "automerge": true
+    },
+    {
+      "matchManagers": ["git-submodules"],
+      "matchPackageNames": ["SzamosiMate/multiconn_archicad"],
+      "groupName": "builtin schemas",
+      "automerge": true
+    }
+  ]
+}
