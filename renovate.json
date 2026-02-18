@@ -1,6 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
+  "prHourlyLimit": 0,
+  "platformAutomerge": false,
   "git-submodules": {
     "enabled": true
   },
@@ -16,6 +18,14 @@
       "matchPackageNames": ["SzamosiMate/multiconn_archicad"],
       "groupName": "builtin schemas",
       "automerge": true
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "automerge": true
+    },
+    {
+      "matchDepNames": ["python"],
+      "enabled": false
     }
   ]
 }
