@@ -1,8 +1,8 @@
 [submodule "deps/tapir"]
 	path = deps/tapir
 	url = https://github.com/ENZYME-APD/tapir-archicad-automation.git
-	branch = 1.3.0
+	branch = main
 [submodule "deps/multiconn"]
 	path = deps/multiconn
 	url = https://github.com/SzamosiMate/multiconn_archicad.git
-	branch = v0.5.2
+	branch = main
