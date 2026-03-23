@@ -3,21 +3,28 @@
   "extends": ["config:recommended"],
   "prHourlyLimit": 0,
   "platformAutomerge": false,
+  "lockFileMaintenance": {
+    "enabled": true
+  },
   "git-submodules": {
     "enabled": true
   },
   "packageRules": [
     {
       "matchManagers": ["git-submodules"],
-      "matchPackageNames": ["ENZYME-APD/tapir-archicad-automation"],
+      "matchDepNames": ["deps/tapir"],
       "groupName": "tapir schemas",
       "automerge": true
     },
     {
       "matchManagers": ["git-submodules"],
-      "matchPackageNames": ["SzamosiMate/multiconn_archicad"],
+      "matchDepNames": ["deps/multiconn"],
       "groupName": "builtin schemas",
       "automerge": true
+    },
+    {
+      "matchManagers": ["pep621"],
+      "rangeStrategy": "update-lockfile"
     },
     {
       "matchManagers": ["github-actions"],
