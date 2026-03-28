@@ -27,6 +27,11 @@
       "rangeStrategy": "update-lockfile"
     },
     {
+      "matchManagers": ["pep621"],
+      "matchDepNames": ["ruff"],
+      "automerge": true
+    },
+    {
       "matchManagers": ["github-actions"],
       "automerge": true
     },
