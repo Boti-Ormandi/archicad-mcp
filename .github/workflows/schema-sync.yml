@@ -33,8 +33,13 @@ jobs:
       - name: Detect which submodule changed
         id: detect
         run: |
-          git diff origin/${{ github.event.pull_request.base.ref }} -- deps/tapir && echo "tapir=true" >> "$GITHUB_OUTPUT" || true
-          git diff origin/${{ github.event.pull_request.base.ref }} -- deps/multiconn && echo "multiconn=true" >> "$GITHUB_OUTPUT" || true
+          git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.ref }}
+          if ! git diff --quiet origin/${{ github.event.pull_request.base.ref }} -- deps/tapir; then
+            echo "tapir=true" >> "$GITHUB_OUTPUT"
+          fi
+          if ! git diff --quiet origin/${{ github.event.pull_request.base.ref }} -- deps/multiconn; then
+            echo "multiconn=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Run schema sync (tapir)
         if: steps.detect.outputs.tapir == 'true'
