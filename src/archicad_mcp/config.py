@@ -96,7 +96,7 @@ def normalize_for_match(path: str) -> str:
     """Normalize path for cross-platform fnmatch comparison.
 
     - Expands ~ to home directory
-    - Resolves to absolute path
+    - Normalizes to an absolute path without resolving short/long-name aliases
     - Converts to forward slashes
     - Lowercases on Windows (case-insensitive filesystem)
 
@@ -106,11 +106,11 @@ def normalize_for_match(path: str) -> str:
     Returns:
         Normalized path string for matching.
     """
-    # Expand ~ and resolve to absolute, canonical path
-    resolved = str(Path(path).expanduser().resolve())
+    # Normalize to an absolute path while preserving Windows short-name segments
+    absolute = os.path.abspath(os.path.expanduser(path))
 
     # Convert to forward slashes
-    normalized = resolved.replace("\\", "/")
+    normalized = absolute.replace("\\", "/")
 
     # Case-insensitive on Windows
     if sys.platform == "win32":
@@ -134,11 +134,7 @@ def matches_pattern(path: str, pattern: str) -> bool:
         True if path matches pattern.
     """
     norm_path = normalize_for_match(path)
-    norm_pattern = expand_pattern(pattern)
-
-    # Also normalize the pattern for case on Windows
-    if sys.platform == "win32":
-        norm_pattern = norm_pattern.lower()
+    norm_pattern = normalize_for_match(expand_pattern(pattern))
 
     return fnmatch.fnmatch(norm_path, norm_pattern)
 
