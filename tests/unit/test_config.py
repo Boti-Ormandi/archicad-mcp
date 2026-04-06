@@ -155,6 +155,17 @@ class TestMatchesPattern:
         test_path = f"{temp}/output.csv"
         assert matches_pattern(test_path, "${TEMP}/*")
 
+    @patch(
+        "archicad_mcp.config.tempfile.gettempdir",
+        return_value=r"C:\Users\RUNNER~1\AppData\Local\Temp",
+    )
+    def test_matches_with_temp_short_path(self, _mock_tempdir: object) -> None:
+        """Matches ${TEMP} patterns when Windows exposes a short-name temp path."""
+        assert matches_pattern(
+            r"C:\Users\RUNNER~1\AppData\Local\Temp\output.csv",
+            "${TEMP}/*",
+        )
+
 
 class TestSecurityConfig:
     """Tests for SecurityConfig dataclass."""
@@ -211,6 +222,18 @@ class TestSecurityConfig:
         cfg = SecurityConfig(mode="sandboxed")
         # Read from random path (not system dir) should be allowed
         assert not cfg.is_path_blocked("C:/Data/input.csv", for_write=False)
+
+    @patch(
+        "archicad_mcp.config.tempfile.gettempdir",
+        return_value=r"C:\Users\RUNNER~1\AppData\Local\Temp",
+    )
+    def test_sandboxed_allows_short_temp_writes(self, _mock_tempdir: object) -> None:
+        """Sandboxed mode allows writes to ${TEMP} even with Windows short paths."""
+        cfg = SecurityConfig(mode="sandboxed")
+        assert not cfg.is_path_blocked(
+            r"C:\Users\RUNNER~1\AppData\Local\Temp\output.csv",
+            for_write=True,
+        )
 
 
 class TestLoadConfig:
