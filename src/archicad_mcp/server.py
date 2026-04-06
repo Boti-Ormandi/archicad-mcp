@@ -1,9 +1,9 @@
 """FastMCP server for Archicad automation."""
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, TypeVar, cast
 
 import aiohttp
 from mcp.server.fastmcp import Context, FastMCP
@@ -25,6 +25,13 @@ from archicad_mcp.scripting import ScriptExecutor
 
 # Context is generic over (Session, LifespanContext, Request) - use Any for all
 Ctx: TypeAlias = Context[Any, Any, Any]
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def typed_tool(decorator: Any) -> Callable[[F], F]:
+    """Cast FastMCP's untyped decorators into a typed decorator shape for mypy."""
+    return cast(Callable[[F], F], decorator)
+
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +76,7 @@ async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     execute_script_description = generate_execute_script_docs(schemas, file_access_docs)
 
     # Dynamically register execute_script with generated description
-    @server.tool(description=execute_script_description)  # type: ignore[untyped-decorator]
+    @typed_tool(server.tool(description=execute_script_description))
     async def execute_script(
         ctx: Ctx,
         port: int,
@@ -105,7 +112,7 @@ mcp = FastMCP(
 # =============================================================================
 # Tool 1: List Archicad Instances
 # =============================================================================
-@mcp.tool()  # type: ignore[untyped-decorator]
+@typed_tool(mcp.tool())
 async def list_instances(ctx: Ctx) -> list[ArchicadInstance]:
     """
     Find all running Archicad instances.
@@ -134,7 +141,7 @@ async def list_instances(ctx: Ctx) -> list[ArchicadInstance]:
 # =============================================================================
 # Tool 3: Get Command Documentation
 # =============================================================================
-@mcp.tool()  # type: ignore[untyped-decorator]
+@typed_tool(mcp.tool())
 async def get_docs(
     ctx: Ctx,
     search: str | None = None,
@@ -204,7 +211,7 @@ async def get_docs(
 # =============================================================================
 # Tool 4: Get Properties
 # =============================================================================
-@mcp.tool()  # type: ignore[untyped-decorator]
+@typed_tool(mcp.tool())
 async def get_properties(
     ctx: Ctx,
     port: int,
