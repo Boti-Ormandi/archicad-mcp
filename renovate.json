@@ -4,7 +4,8 @@
   "prHourlyLimit": 0,
   "platformAutomerge": false,
   "lockFileMaintenance": {
-    "enabled": true
+    "enabled": true,
+    "automerge": true
   },
   "git-submodules": {
     "enabled": true
@@ -28,7 +29,7 @@
     },
     {
       "matchManagers": ["pep621"],
-      "matchDepNames": ["ruff"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "automerge": true
     },
     {
