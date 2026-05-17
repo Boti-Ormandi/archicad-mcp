@@ -1,11 +1,24 @@
 [project]
 name = "archicad-mcp"
-version = "0.1.0"
+dynamic = ["version"]
 description = "MCP server for Archicad automation via the Tapir JSON API"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Botond Ormandi" }]
 requires-python = ">=3.11"
+keywords = ["archicad", "tapir", "bim", "aec", "cad", "mcp", "model-context-protocol", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
 dependencies = [
     "mcp>=1.0.0",
     "aiohttp>=3.9.0",
@@ -15,7 +28,9 @@ dependencies = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/Boti-Ormandi/archicad-mcp"
 Repository = "https://github.com/Boti-Ormandi/archicad-mcp"
+Issues = "https://github.com/Boti-Ormandi/archicad-mcp/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -32,8 +47,11 @@ archicad-mcp = "archicad_mcp.server:main"
 archicad-mcp-sync = "archicad_mcp.schemas.cache:sync_cli"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
 
 # =============================================================================
 # Ruff - Linting & Formatting

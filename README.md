@@ -30,16 +30,6 @@ Built on a script-first architecture: instead of wrapping every Archicad command
 
 ## Quick Start
 
-### Install
-
-```bash
-git clone https://github.com/Boti-Ormandi/archicad-mcp.git
-cd archicad-mcp
-uv sync
-```
-
-### Configure your MCP client
-
 Add to your MCP client configuration (e.g. Claude Desktop, VS Code, etc.):
 
 ```json
@@ -47,12 +37,14 @@ Add to your MCP client configuration (e.g. Claude Desktop, VS Code, etc.):
   "mcpServers": {
     "archicad": {
       "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/archicad-mcp", "archicad-mcp"]
+      "command": "uvx",
+      "args": ["archicad-mcp"]
     }
   }
 }
 ```
+
+`uvx` fetches the latest release from PyPI on first run. Pin a specific version with `["archicad-mcp@0.1.0"]`. To run from a local checkout instead, see [Development](#development).
 
 ### Use
 
@@ -81,8 +73,28 @@ The script executor supports two security modes, controlled via environment vari
 ## Development
 
 ```bash
+git clone https://github.com/Boti-Ormandi/archicad-mcp.git
+cd archicad-mcp
 uv sync --all-extras   # runtime + dev tooling (ruff, mypy, pytest)
+```
 
+To point your MCP client at the local checkout instead of the published package:
+
+```json
+{
+  "mcpServers": {
+    "archicad": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/archicad-mcp", "archicad-mcp"]
+    }
+  }
+}
+```
+
+Dev tooling:
+
+```bash
 # Lint and format
 ruff check src/
 ruff format src/
