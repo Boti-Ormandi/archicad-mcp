@@ -1,5 +1,10 @@
 # archicad-mcp
 
+[![CI](https://github.com/Boti-Ormandi/archicad-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Boti-Ormandi/archicad-mcp/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-261230.svg)](https://github.com/astral-sh/ruff)
+
 MCP server for Archicad automation. Connects AI assistants to running Archicad instances via the [Tapir JSON API](https://github.com/ENZYME-APD/tapir-archicad-automation), enabling everything from simple queries to complex multi-step workflows through Python scripting.
 
 Built on a script-first architecture: instead of wrapping every Archicad command as a separate tool, the server exposes 4 tools and lets the AI write Python for complex operations.
@@ -75,14 +80,8 @@ The script executor supports two security modes, controlled via environment vari
 
 ## Development
 
-The repo uses git submodules in `deps/` for upstream schema tracking (CI-only, not needed for local development). If you need to run the schema sync tool locally:
-
 ```bash
-git submodule update --init
-```
-
-```bash
-uv sync --all-extras
+uv sync --all-extras   # runtime + dev tooling (ruff, mypy, pytest)
 
 # Lint and format
 ruff check src/
@@ -96,6 +95,16 @@ pytest -m "not integration"
 
 # Integration tests (requires running Archicad)
 pytest
+```
+
+### Schema sync
+
+The repo uses git submodules in `deps/` for upstream schema tracking (CI-only, not needed for local development). To regenerate the embedded schemas locally:
+
+```bash
+git submodule update --init
+archicad-mcp-sync deps/tapir       # regenerates src/archicad_mcp/schemas/tapir.json
+archicad-mcp-sync deps/multiconn   # regenerates src/archicad_mcp/schemas/builtin.json
 ```
 
 ## License

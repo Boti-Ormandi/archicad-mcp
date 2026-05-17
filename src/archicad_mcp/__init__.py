@@ -1,3 +1,3 @@
-"""Archicad MCP Server - Powerful Archicad automation via JSON API and Python scripting."""
+"""MCP server for Archicad automation via the Tapir JSON API."""
 
 __version__ = "0.1.0"
