@@ -6,123 +6,45 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-261230.svg)](https://github.com/astral-sh/ruff)
 
-MCP server for Archicad automation. Connects AI assistants to running Archicad instances via the [Tapir JSON API](https://github.com/ENZYME-APD/tapir-archicad-automation), enabling everything from simple queries to complex multi-step workflows through Python scripting.
+`archicad-mcp` is a native MCP server for Archicad automation. It uses `mcp>=2,<3` over stdio and exposes four tools: `list_instances`, `get_docs`, `get_properties`, and `execute_script`.
 
-Built on a script-first architecture: 4 MCP tools front 173 underlying Archicad commands (100 Tapir + 73 built-in). Rather than expose each command as its own tool, the server lets the AI write Python directly against the API.
+The command library is available before Archicad is running. Immutable packaged snapshots provide the baseline command registry, so clients can browse, search, and retrieve Archicad and Tapir documentation as soon as the server starts. By default, each server start performs one bounded nonblocking update check against the authoritative Tapir GitHub repository and can activate a newer validated schema stored in the OS user cache directory; the installed package is never modified.
 
 ## Design
 
-**Minimal tool surface.** Every Archicad command is accessible through `execute_script`, which provides full async Python with loops, filtering, and file I/O. Complex logic lives in Python scripts, not in per-command tool wrappers.
+**Native MCP with a small tool surface.** The server is implemented on the native MCP SDK and serves stdio by default. Four MCP tools cover instance discovery, command documentation, property discovery, and script execution rather than exposing every Archicad command as a separate MCP tool.
 
-**Dynamic documentation.** The `execute_script` tool description is generated at startup from live Archicad schemas. The AI always sees accurate command signatures, parameter types, and examples - no stale docs.
+**Immutable documentation registry.** `builtin.json` and `tapir.json` are packaged baseline snapshots. The Tapir snapshot is generated from the Tapir add-on's own `GenerateDocumentation` output for release 1.5.8 (upstream: [ENZYME-APD/tapir-archicad-automation](https://github.com/ENZYME-APD/tapir-archicad-automation), MIT license); each command entry records the add-on version that introduced or last changed it. The packaged baseline is therefore Tapir 1.5.8: every documented Tapir command is available on that add-on release, and an installed add-on older than a command's recorded version does not implement that command. `get_docs` reads the immutable capability registry; it does not generate or ingest documentation from a live Archicad process. The complete packaged command library remains discoverable even when no Archicad instance is running.
 
-**Multi-instance.** Parallel port scanning across 19723-19744 discovers all running Archicad instances. Target any instance by port number - work with multiple projects simultaneously.
+**Deterministic discovery and retrieval.** `get_docs()` browses the catalog, `get_docs(search="...")` performs intent search, and exact or batch retrieval accepts both bare and namespaced IDs. For example, `CreateSlabs` and `tapir:CreateSlabs` identify the same Tapir capability, while `API.GetAllElements` and `native:API.GetAllElements` identify the same native capability.
 
-**Full-text search.** Inverted index over all command schemas with weighted field scoring and fuzzy matching via rapidfuzz. Typo-tolerant: "proprty" still finds property commands.
+**Direct Tapir schema updates.** The active Tapir schema is always the newer valid schema by strict semantic version between the packaged snapshot and the user-cache snapshot; equal versions always select the packaged snapshot. By default the running server schedules one bounded, nonblocking update check at startup when the shared 24-hour TTL permits; there is no recurring timer and nothing runs after the server exits. Startup immediately serves the packaged or cached catalog and never waits for the network. `ARCHICAD_MCP_AUTO_UPDATE=0` disables automatic checks without disabling or downgrading the cache, `ARCHICAD_MCP_OFFLINE=1` forbids all update network access while continuing to load the cache, and `archicad-mcp schemas update` requests a manual check. See [Tapir schema updates](#tapir-schema-updates).
+
+**Multi-instance discovery.** The default local scan covers ports 19723 through 19743 inclusive. Port 19744 is not part of the default range.
+
+**Honest local execution.** `execute_script` runs Python in a disposable same-user `local_user` child process. The child provides timeout/cancellation handling, stdout/stderr capture, and structured failures, but it is not hostile-code isolation: the script has the ordinary authority of the user account. There is no approval or confirmation gate.
 
 ## Tools
 
 | Tool | Purpose |
-|------|---------|
-| `list_instances` | Discover running Archicad instances (port, project name, version, Tapir status) |
-| `execute_script` | Execute Python with full async Archicad API access and file I/O |
-| `get_docs` | Search and retrieve command documentation (schemas, examples, parameters) |
-| `get_properties` | Discover element properties (area, volume, length) with cached GUID lookup |
-
-## Example
-
-A typical interaction — "give me a room area schedule by floor":
-
-The AI calls `list_instances` to find a running Archicad:
-
-```json
-[
-  {
-    "port": 19723,
-    "project_name": "Residential_Block.pln",
-    "project_path": "C:/Projects/Residential_Block.pln",
-    "project_type": "solo",
-    "archicad_version": "27.0.0",
-    "is_tapir_available": true
-  }
-]
-```
-
-Then `get_properties` to look up the GUID for "Net Area":
-
-```json
-{
-  "found": true,
-  "property": {
-    "name": "Net Area",
-    "group": "Zone",
-    "guid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "type": "StaticBuiltIn",
-    "value_type": "Real",
-    "measure_type": "Area",
-    "editable": false
-  }
-}
-```
-
-Then `execute_script` with the Python it composes from those lookups:
-
-```python
-zones = (await archicad.tapir("GetElementsByType", {"elementType": "Zone"}))["elements"]
-details = (await archicad.tapir("GetDetailsOfElements", {"elements": zones}))["detailsOfElements"]
-# guid from the get_properties response above
-props = (await archicad.tapir("GetPropertyValuesOfElements", {
-    "elements": zones,
-    "properties": [{"propertyId": {"guid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"}}],
-}))["propertyValuesForElements"]
-
-by_floor: dict = {}
-for zone, det, row in zip(zones, details, props):
-    floor = det["floorIndex"]
-    raw_area = row["propertyValues"][0]["propertyValue"]["value"]
-    # Locale: Archicad may return "12,40" instead of "12.40"
-    area = float(str(raw_area).replace(",", "."))
-    bucket = by_floor.setdefault(floor, {"zones": [], "total_m2": 0.0})
-    bucket["zones"].append({"name": det["details"]["name"], "area_m2": round(area, 2)})
-    bucket["total_m2"] = round(bucket["total_m2"] + area, 2)
-
-result = {"total_zones": len(zones), "by_floor": by_floor}
-```
-
-Returns:
-
-```json
-{
-  "success": true,
-  "result": {
-    "total_zones": 18,
-    "by_floor": {
-      "0": {
-        "zones": [
-          {"name": "Entrance Hall", "area_m2": 8.4},
-          {"name": "Living Room", "area_m2": 32.1}
-        ],
-        "total_m2": 55.2
-      },
-      "1": {
-        "zones": [
-          {"name": "Master Bedroom", "area_m2": 22.3}
-        ],
-        "total_m2": 37.1
-      }
-    }
-  },
-  "execution_time_ms": 287
-}
-```
-
-A per-command MCP server would chain those API calls into separate tool invocations and force the AI to aggregate client-side. With `execute_script`, the chain, the loop, and the aggregation all live in one round-trip.
+| --- | --- |
+| `list_instances` | Discover running Archicad instances on the default local port range and report project/version/Tapir availability, including each instance's observed Tapir version when it reports one. |
+| `get_docs` | Deterministically browse the command catalog, intent-search it, or retrieve one or many exact command documents by bare or namespaced ID. |
+| `get_properties` | Discover Archicad element properties and property identifiers for a selected running instance. |
+| `execute_script` | Execute Python against a selected Archicad instance in a disposable same-user child process. |
 
 ## Quick Start
 
-Install the [Tapir add-on](https://github.com/ENZYME-APD/tapir-archicad-automation) into your Archicad (versions 25–29 supported, Windows and macOS). It ships as a per-version `.apx` (Windows) or `.zip` (macOS) file, installed via Archicad's *Options → Add-On Manager → Add*.
+`uvx` can run the published package without a separate project installation:
 
-Then add to your MCP client configuration (e.g. Claude Desktop, VS Code, etc.):
+```bash
+uvx archicad-mcp --help
+uvx archicad-mcp doctor --json
+```
+
+`archicad-mcp` with no arguments starts the stdio MCP server. The explicit equivalent is `archicad-mcp serve`.
+
+Add it to an MCP client configuration:
 
 ```json
 {
@@ -136,41 +58,100 @@ Then add to your MCP client configuration (e.g. Claude Desktop, VS Code, etc.):
 }
 ```
 
-`uvx` fetches the latest release from PyPI on first run. Pin to a specific version like `["archicad-mcp@0.1.0"]`. To run from a local checkout instead, see [Development](#development).
+For a ready-to-copy configuration snippet, run:
 
-### Use
+```bash
+uvx archicad-mcp setup
+```
 
-With Archicad running, the server auto-discovers instances on startup. Ask your AI assistant to interact with Archicad — it has full access to the command reference and can write scripts for complex operations.
+`setup` is output-only; it does not edit client configuration files. `archicad-mcp config` is also read-only and reports the effective runtime settings.
+
+Install the [Tapir add-on](https://github.com/ENZYME-APD/tapir-archicad-automation) that is compatible with the Archicad major you use for full native + Tapir capability. If Archicad is reachable without Tapir, the capability view reports `tapir_unavailable`: native capabilities remain available, while Tapir-only capabilities are omitted.
+
+## Use
+
+Documentation discovery does not require Archicad to be running. Typical `get_docs` modes are:
+
+```text
+get_docs()                                      # browse overview/categories
+get_docs(category="Element Listing Commands") # deterministic category browse
+get_docs(search="create slab")                 # intent search
+get_docs(command="CreateSlabs")                # exact Tapir retrieval
+get_docs(command="tapir:CreateSlabs")          # same exact Tapir capability
+get_docs(command="API.GetAllElements")         # exact native retrieval
+get_docs(commands=["CreateSlabs", "API.GetAllElements"])  # batch retrieval
+```
+
+When Archicad is running, call `list_instances` to discover targets, use `get_properties` or `get_docs` to gather identifiers and command contracts, then call `execute_script` for multi-step Python workflows. The default execution timeout is 300 seconds; timeout and transport cancellation terminate the owned worker. Stdout and stderr are captured and failures are returned in structured form.
+
+Useful CLI commands are:
+
+```bash
+archicad-mcp                 # stdio serve
+archicad-mcp serve           # explicit stdio serve
+archicad-mcp doctor --json   # package/schema/Archicad diagnostics
+archicad-mcp setup           # print MCP client setup only
+archicad-mcp config          # read-only effective configuration
+archicad-mcp schemas status  # local-only packaged/cache/active/check diagnostics
+archicad-mcp schemas update  # manual update check (honors offline mode)
+archicad-mcp schemas reset   # delete the cached schema and check state
+archicad-mcp --help
+archicad-mcp --version
+```
 
 ## Security
 
-The script executor supports two security modes, controlled via environment variables:
+`execute_script` uses the `local_user` execution model. A script runs in a disposable child process under the same user account as the server. The process boundary is for reliability and cancellation, not hostile-code containment: scripts can use ordinary Python imports, access files available to the user, start processes, make network requests, and perform destructive Archicad/Tapir operations with that user's authority. There is no filesystem path policy and no approval/confirmation gate.
 
-| Variable | Values | Default |
-|----------|--------|---------|
-| `ARCHICAD_MCP_SECURITY` | `unrestricted`, `sandboxed` | `unrestricted` |
-| `ARCHICAD_MCP_BLOCKED_PATHS` | Comma-separated glob patterns | OS system directories |
-| `ARCHICAD_MCP_ALLOWED_WRITE_PATHS` | Comma-separated glob patterns | Desktop, Documents, temp |
+Schema acquisition has its own bounded network boundary. Update traffic goes only to fixed GitHub endpoints for the upstream [ENZYME-APD/tapir-archicad-automation](https://github.com/ENZYME-APD/tapir-archicad-automation) repository over strict HTTPS with no redirects, under size and time limits, and no token or other credential is read from configuration or environment. First use trusts that public GitHub repository, GitHub TLS, and the stable release metadata it presents — the same upstream users already trust for the Tapir add-on binary; the project operates no feed and makes no additional signature or independent-review claim. Acceptance is monotonic: a moved tag for an already accepted version, a hash mismatch, or an older release is refused and the active schema is retained. Future releases are accepted only while the upstream `LICENSE` bytes match the MIT identity pinned with the packaged baseline; a changed license fails closed until a reviewed package release updates the pin.
 
-**Unrestricted** (default): Read/write access to most paths. System directories (e.g. `C:/Windows`, `/usr`) are always blocked.
+Runtime cache/state belongs in the OS user cache directory. The server never writes into the installed package and does not require Git, a checkout, submodules, tokens, or a manual schema refresh on the user side.
 
-**Sandboxed**: Read access everywhere, write access restricted to the allowed paths list.
+| Variable | Behavior |
+| --- | --- |
+| `ARCHICAD_MCP_AUTO_UPDATE` | Unset or `1`: automatic startup checks are enabled (the default). Exactly `0`: automatic checks are disabled; cached schemas remain usable. |
+| `ARCHICAD_MCP_OFFLINE` | Set exactly to `1`: all update network access is forbidden, the newest valid cached schema remains active, and manual updates refuse with an offline error. Overrides automatic mode. |
+
+## Tapir schema updates
+
+Every release contains immutable `builtin.json` and `tapir.json` baseline snapshots. They are sufficient to start the server and discover the packaged command catalog offline, and they document the newest validated Tapir release available at packaging time.
+
+At startup the running server schedules at most one update check, gated by a shared 24-hour TTL across processes. The check is a single bounded background task inside the already-running MCP server: it never delays startup, never recurs on a timer, and nothing runs after the server exits. A successful check reprojects the capability view atomically; a failed, disabled, or skipped check retains the active view untouched.
+
+Selection compares strict semantic versions. A candidate newer than the active schema is transformed, validated, and accepted; an equal version with the same recorded commit and input hashes is treated as current; an equal version with a different commit or any different accepted hash is refused as equivocation — a moved release tag is equivocation even when the derived bytes match; an older version is refused as rollback. A newer cache stays active across restarts and in offline mode until a newer package supersedes it, and equal versions always select the packaged snapshot.
+
+Acquisition is fixed to the stable GitHub Releases of [ENZYME-APD/tapir-archicad-automation](https://github.com/ENZYME-APD/tapir-archicad-automation). The server lists stable releases, selects the highest bare SemVer tag client-side, resolves and peels that tag to an exact commit, and downloads exactly three files at that commit over strict HTTPS: the two generated documentation inputs and the `LICENSE` file. Responses are size- and time-limited, and no token is read. The inputs pass a strict, non-executing transformation and full registry validation before anything is published to the cache. A future upstream release is accepted only while its `LICENSE` file keeps the MIT identity pinned by the packaged baseline; a changed license fails closed until a reviewed package release updates the pinned license policy.
+
+Validated snapshots are cached under the OS user cache directory (`archicad-mcp/schema-cache/`) together with bounded check state and a permanent lock file. Cache corruption is treated as absent, surfaced by `doctor` and `schemas status`, and may self-heal on a later successful update. Nothing is ever written into the installed package.
+
+Manual control:
+
+```bash
+archicad-mcp schemas status --json   # local-only packaged/cache/active/check diagnostics; never networks
+archicad-mcp schemas update --json   # immediate manual check; bypasses the TTL but honors offline mode
+archicad-mcp schemas reset --json    # delete the cached snapshot and check state; the only downgrade-to-package operation
+```
+
+See [Native v2 release guide](docs/native-v2.md) for migration, compatibility, and maintainer regeneration notes.
 
 ## Requirements
 
 - Python 3.11+
-- Archicad 25–29 with the [Tapir add-on](https://github.com/ENZYME-APD/tapir-archicad-automation) installed
 - An MCP-compatible client
+- For live automation: a supported Archicad major
+- For full capability: a Tapir add-on release built for that Archicad major
+
+Without Tapir, a reachable Archicad instance operates in the documented `tapir_unavailable` partial mode: native capabilities remain available and Tapir-only capabilities are omitted. The active documentation describes current Tapir behavior; it does not prove exact support for every older installed add-on. Each command records the add-on version that introduced or last changed it, and an installed add-on older than a command's recorded version does not implement that command.
 
 ## Development
 
 ```bash
 git clone https://github.com/Boti-Ormandi/archicad-mcp.git
 cd archicad-mcp
-uv sync --all-extras   # runtime + dev tooling (ruff, mypy, pytest)
+uv sync --frozen --all-extras --dev
 ```
 
-To point your MCP client at the local checkout instead of the published package:
+To point an MCP client at a local checkout:
 
 ```json
 {
@@ -184,32 +165,20 @@ To point your MCP client at the local checkout instead of the published package:
 }
 ```
 
-Dev tooling:
+Quality checks:
 
 ```bash
-# Lint and format
-ruff check src/
-ruff format src/
-
-# Type check
-mypy src/
-
-# Tests (unit + mock, no Archicad needed)
-pytest -m "not integration"
-
-# Integration tests (requires running Archicad)
-pytest
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run mypy src
+uv run pytest -m "not integration"
 ```
 
-### Schema sync
+The unit and MCP protocol/stdio tests do not require a running Archicad instance. Ordinary source development does not regenerate or rewrite the packaged schema snapshots. Do not initialize repository submodules or run a manual schema refresh to update them; replacing packaged snapshots and refreshing their upstream provenance pins are explicit maintainer release operations described in [docs/native-v2.md](docs/native-v2.md).
 
-The repo uses git submodules in `deps/` for upstream schema tracking (CI-only, not needed for local development). To regenerate the embedded schemas locally:
+## Migration from 0.1.x
 
-```bash
-git submodule update --init
-archicad-mcp-sync deps/tapir       # regenerates src/archicad_mcp/schemas/tapir.json
-archicad-mcp-sync deps/multiconn   # regenerates src/archicad_mcp/schemas/builtin.json
-```
+The native-v2 release uses the native MCP SDK and the `archicad-mcp` console command. Existing client configurations should launch the public `uvx archicad-mcp` console command rather than calling unsupported package-internal server entry points. See [docs/native-v2.md](docs/native-v2.md) for the migration checklist and compatibility behavior.
 
 ## License
 

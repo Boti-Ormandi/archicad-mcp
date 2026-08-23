@@ -1,5 +1,7 @@
 """Unit tests for Pydantic models."""
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -9,6 +11,31 @@ from archicad_mcp.models import (
     DocSearchResult,
     ScriptResult,
 )
+
+
+class TestMultipleInstancesTapirVersions:
+    """Instances on different add-on releases report differing versions."""
+
+    def test_instances_may_differ_in_tapir_version(self) -> None:
+        first = ArchicadInstance(
+            port=19723,
+            project_name="A",
+            project_path=None,
+            project_type="solo",
+            archicad_version="29",
+            is_tapir_available=True,
+            tapir_version="1.5.8",
+        )
+        second = ArchicadInstance(
+            port=19724,
+            project_name="B",
+            project_path=None,
+            project_type="solo",
+            archicad_version="28",
+            is_tapir_available=True,
+            tapir_version="1.4.0",
+        )
+        assert {first.tapir_version, second.tapir_version} == {"1.5.8", "1.4.0"}
 
 
 class TestArchicadInstance:
@@ -65,6 +92,34 @@ class TestArchicadInstance:
             )
         assert "project_type" in str(exc_info.value)
 
+    def test_tapir_version_defaults_to_null_and_serializes_additively(self) -> None:
+        """tapir_version is optional, defaults to null, and always serializes."""
+        instance = ArchicadInstance(
+            port=19723,
+            project_name="Test",
+            project_path=None,
+            project_type="solo",
+            archicad_version="29",
+            is_tapir_available=True,
+        )
+        assert instance.tapir_version is None
+        payload: dict[str, Any] = dict(instance.model_dump())
+        assert payload["tapir_version"] is None
+
+    def test_tapir_version_is_retained_when_reported(self) -> None:
+        """An exactly reported Tapir version is retained verbatim."""
+        instance = ArchicadInstance(
+            port=19724,
+            project_name="Test",
+            project_path=None,
+            project_type="solo",
+            archicad_version="29",
+            is_tapir_available=True,
+            tapir_version="1.5.8",
+        )
+        assert instance.tapir_version == "1.5.8"
+        assert instance.model_dump()["tapir_version"] == "1.5.8"
+
 
 class TestScriptResult:
     """Tests for ScriptResult model."""
@@ -79,6 +134,7 @@ class TestScriptResult:
             execution_time_ms=150,
         )
         assert result.success is True
+        assert result.result is not None
         assert result.result["count"] == 42
         assert result.error is None
 

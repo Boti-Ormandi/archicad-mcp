@@ -1,351 +1,303 @@
-"""Unit tests for ScriptExecutor."""
+"""Unit tests for disposable local-user script execution."""
 
-from unittest.mock import AsyncMock, MagicMock
+from __future__ import annotations
+
+import asyncio
+import io
+import socket
+import sys
+import time
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
+from aiohttp import web
 
+from archicad_mcp.scripting import worker as worker_module
 from archicad_mcp.scripting.executor import ScriptExecutor
 
 
 @pytest.fixture
-def mock_connection() -> MagicMock:
-    """Create a mock ArchicadConnection."""
-    conn = MagicMock()
-    conn.port = 19723
-    conn.execute = AsyncMock(return_value={"elements": []})
-    return conn
-
-
-@pytest.fixture
 def executor() -> ScriptExecutor:
-    """Create a ScriptExecutor instance."""
     return ScriptExecutor()
 
 
-class TestBasicExecution:
-    """Tests for basic script execution."""
-
-    async def test_simple_script_returns_result(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Simple script setting result works."""
-        script = "result = 42"
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == 42
-        assert res.error is None
-
-    async def test_script_with_computation(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Script can perform computations."""
-        script = """
-x = 10
-y = 20
-result = x + y
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == 30
-
-    async def test_script_without_result_returns_none(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Script without result assignment returns None."""
-        script = "x = 42"
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result is None
-
-    async def test_dict_result(self, executor: ScriptExecutor, mock_connection: MagicMock) -> None:
-        """Script can return dict."""
-        script = 'result = {"count": 5, "items": [1, 2, 3]}'
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == {"count": 5, "items": [1, 2, 3]}
-
-
-class TestAsyncExecution:
-    """Tests for async/await support."""
-
-    async def test_await_archicad_api(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Script can await archicad API calls."""
-        mock_connection.execute = AsyncMock(
-            return_value={"elements": [{"guid": "abc"}, {"guid": "def"}]}
+@pytest.fixture
+async def fake_archicad_port() -> AsyncIterator[int]:
+    async def handle(request: web.Request) -> web.Response:
+        payload = await request.json()
+        command = payload["command"]
+        if command == "API.GetProductInfo":
+            return web.json_response({"succeeded": True, "result": {"version": "test-version"}})
+        if command == "API.ExecuteAddOnCommand":
+            parameters = payload["parameters"]["addOnCommandParameters"]
+            return web.json_response(
+                {"succeeded": True, "result": {"addOnCommandResponse": {"echo": parameters}}}
+            )
+        return web.json_response(
+            {"succeeded": False, "error": {"code": 1, "message": "unexpected command"}}
         )
 
-        script = """
-response = await archicad.tapir("GetElementsByType", {"elementType": "Wall"})
-elements = response.get("elements", [])
-result = len(elements)
-"""
-        res = await executor.run(script, mock_connection)
+    app = web.Application()
+    app.router.add_post("/", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
 
-        assert res.success is True
-        assert res.result == 2
-
-    async def test_multiple_awaits(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Script can have multiple await calls."""
-        call_count = 0
-
-        async def mock_execute(cmd: str, params: dict) -> dict:
-            nonlocal call_count
-            call_count += 1
-            return {"elements": [{"guid": f"elem-{call_count}"}]}
-
-        mock_connection.execute = mock_execute
-
-        script = """
-walls_resp = await archicad.tapir("GetElementsByType", {"elementType": "Wall"})
-walls = walls_resp.get("elements", [])
-columns_resp = await archicad.tapir("GetElementsByType", {"elementType": "Column"})
-columns = columns_resp.get("elements", [])
-result = len(walls) + len(columns)
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == 2
-        assert call_count == 2
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(128)
+    sock.setblocking(False)
+    port = int(sock.getsockname()[1])
+    site = web.SockSite(runner, sock)
+    await site.start()
+    try:
+        yield port
+    finally:
+        await runner.cleanup()
 
 
-class TestStdoutCapture:
-    """Tests for stdout capture."""
-
-    async def test_print_captured(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Print statements are captured in stdout."""
-        script = """
-print("Hello")
-print("World")
-result = 42
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert "Hello" in res.stdout
-        assert "World" in res.stdout
-
-    async def test_print_with_formatting(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Print with formatting works."""
-        script = """
-name = "test"
-count = 5
-print(f"Found {count} items in {name}")
-result = count
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert "Found 5 items in test" in res.stdout
-
-
-class TestErrorHandling:
-    """Tests for error handling."""
-
-    async def test_syntax_error_reports_line(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Syntax errors report line number."""
-        script = """x = 1
-y = 2
-if True
-    z = 3
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is False
-        assert "Syntax error" in res.error
-        assert "line" in res.error.lower()
-
-    async def test_runtime_error_reports_line(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Runtime errors report line number."""
-        script = """x = 1
-y = 0
-z = x / y
-result = z
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is False
-        assert "ZeroDivisionError" in res.error
-        assert "Line" in res.error
-
-    async def test_name_error(self, executor: ScriptExecutor, mock_connection: MagicMock) -> None:
-        """Undefined variable error is caught."""
-        script = "result = undefined_var"
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is False
-        assert "NameError" in res.error
-
-    async def test_key_error(self, executor: ScriptExecutor, mock_connection: MagicMock) -> None:
-        """KeyError is caught."""
-        script = """
-d = {"a": 1}
-result = d["missing"]
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is False
-        assert "KeyError" in res.error
-
-
-class TestTimeout:
-    """Tests for timeout handling."""
-
-    async def test_timeout_exceeded(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Script exceeding timeout returns error."""
-        script = """
+async def test_ordinary_result_async_execution_and_full_imports(executor: ScriptExecutor) -> None:
+    script = """
 import asyncio
-await asyncio.sleep(10)
-result = "done"
+import hashlib
+import os
+await asyncio.sleep(0)
+result = {"value": 21 * 2, "hash": hashlib.sha256(b"x").hexdigest(), "sep": os.sep}
 """
-        res = await executor.run(script, mock_connection, timeout_seconds=1)
+    response = await executor.run(script, 19723)
 
-        assert res.success is False
-        assert "timed out" in res.error.lower()
-        assert "1 seconds" in res.error
-
-    async def test_no_timeout_allows_completion(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Script completes when no timeout set."""
-        script = "result = 'completed'"
-        res = await executor.run(script, mock_connection, timeout_seconds=None)
-
-        assert res.success is True
-        assert res.result == "completed"
+    assert response.success is True
+    assert response.result == {
+        "value": 42,
+        "hash": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+        "sep": "\\" if sys.platform == "win32" else "/",
+    }
+    assert response.execution_model == "local_user"
+    assert response.error_code is None
 
 
-class TestResultTruncation:
-    """Tests for large result truncation."""
+async def test_captures_stdout_and_stderr(executor: ScriptExecutor) -> None:
+    response = await executor.run(
+        'import os, sys\nos.write(1, b"raw stdout\\n")\nos.write(2, b"raw stderr\\n")\nprint("captured stdout")\nprint("captured stderr", file=sys.stderr)\nresult = 1',
+        19723,
+    )
 
-    async def test_small_list_not_truncated(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Lists under 500 items are not truncated."""
-        script = "result = list(range(100))"
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == list(range(100))
-
-    async def test_large_list_truncated(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Lists over 500 items are truncated with metadata."""
-        script = "result = list(range(1000))"
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert isinstance(res.result, dict)
-        assert res.result["total"] == 1000
-        assert res.result["truncated"] is True
-        assert len(res.result["sample"]) == 50
-        assert "warning" in res.result
-
-    async def test_dict_not_truncated(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Dict results are not truncated."""
-        script = 'result = {"key": "value", "count": 1000}'
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == {"key": "value", "count": 1000}
+    assert response.success is True
+    assert response.stdout.splitlines() == ["raw stdout", "captured stdout"]
+    assert response.stderr.splitlines() == ["raw stderr", "captured stderr"]
 
 
-class TestAllowedModules:
-    """Tests for allowed module access."""
+async def test_json_result_is_not_arbitrarily_truncated(executor: ScriptExecutor) -> None:
+    response = await executor.run("result = list(range(1000))", 19723)
 
-    async def test_json_module(self, executor: ScriptExecutor, mock_connection: MagicMock) -> None:
-        """json module is available."""
-        script = """
-import json
-result = json.dumps({"a": 1})
+    assert response.success is True
+    assert response.result == list(range(1000))
+
+
+async def test_non_json_result_is_structured_failure(executor: ScriptExecutor) -> None:
+    response = await executor.run("result = {1, 2, 3}", 19723)
+
+    assert response.success is False
+    assert response.result is None
+    assert response.error_code == "result_not_json"
+    assert response.error == "Script result is not JSON-compatible"
+    assert response.execution_model == "local_user"
+
+
+@pytest.mark.parametrize(
+    ("script", "error_code", "needle"),
+    [
+        ("x =\n", "syntax_error", "SyntaxError"),
+        ("value = 1 / 0\nresult = value", "runtime_error", "ZeroDivisionError"),
+    ],
+)
+async def test_script_errors_have_useful_lines_without_internal_paths(
+    executor: ScriptExecutor,
+    script: str,
+    error_code: str,
+    needle: str,
+) -> None:
+    response = await executor.run(script, 19723)
+
+    assert response.success is False
+    assert response.error_code == error_code
+    assert response.error is not None
+    assert needle in response.error
+    assert "Line 1" in response.error
+    assert "worker.py" not in response.error
+    assert "executor.py" not in response.error
+    assert "archicad-mcp-simplified-integration" not in response.error
+
+
+async def test_default_override_and_disabled_timeout_contract(executor: ScriptExecutor) -> None:
+    assert executor.default_timeout_seconds == 300.0
+
+    response = await executor.run(
+        "import asyncio\nawait asyncio.sleep(0.01)\nresult = 'done'",
+        19723,
+        timeout_seconds=5.0,
+    )
+    disabled = await executor.run("result = 'no deadline'", 19723, timeout_seconds=None)
+
+    assert response.success is True
+    assert response.result == "done"
+    assert disabled.success is True
+    assert disabled.result == "no deadline"
+
+
+async def test_single_cpu_loop_times_out_and_owned_worker_is_cleaned(
+    executor: ScriptExecutor,
+) -> None:
+    response = await executor.run("while True:\n    pass", 19723, timeout_seconds=0.1)
+
+    assert response.success is False
+    assert response.error_code == "timeout"
+    assert response.error == "Script timed out after 0.1 seconds"
+    assert response.execution_time_ms < 5000
+
+
+async def test_cancellation_terminates_exact_owned_child(
+    executor: ScriptExecutor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_create = asyncio.create_subprocess_exec
+    owned: list[asyncio.subprocess.Process] = []
+    child_started = asyncio.Event()
+
+    async def capture_create(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        process = await original_create(*args, **kwargs)
+        owned.append(process)
+        child_started.set()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_create)
+    task = asyncio.create_task(
+        executor.run(
+            "import asyncio\nawait asyncio.sleep(60)\nresult = 'late'",
+            19723,
+            timeout_seconds=None,
+        )
+    )
+    await asyncio.wait_for(child_started.wait(), timeout=5)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(owned) == 1
+    assert owned[0].returncode is not None
+
+
+async def test_worker_start_failure_is_structured_without_os_details(
+    executor: ScriptExecutor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = r"E:\private\python.exe"
+
+    async def fail_create(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        raise FileNotFoundError(secret)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_create)
+
+    response = await executor.run("result = 1", 19723)
+
+    assert response.success is False
+    assert response.error_code == "worker_start"
+    assert response.error == "Script worker could not be started"
+    assert response.stdout == ""
+    assert response.stderr == ""
+    assert secret not in response.error
+
+
+async def test_surrogate_source_returns_structured_script_failure(executor: ScriptExecutor) -> None:
+    script = "raise ValueError('\ud800')"
+
+    response = await executor.run(script, 19723)
+
+    assert response.success is False
+    assert response.error_code in {"syntax_error", "runtime_error"}
+    assert response.error is not None
+    assert response.execution_model == "local_user"
+
+
+async def test_abnormal_worker_exit_is_structured(executor: ScriptExecutor) -> None:
+    response = await executor.run("import os\nos._exit(7)", 19723)
+
+    assert response.success is False
+    assert response.error_code == "worker_exit"
+    assert response.error == "Script worker exited abnormally with code 7"
+    assert response.stdout == ""
+    assert response.stderr == ""
+
+
+async def test_malformed_worker_response_is_structured(
+    executor: ScriptExecutor,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = (
+        sys.executable,
+        "-c",
+        "import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write(b'not-json')",
+    )
+    monkeypatch.setattr(executor, "_worker_command", lambda: command)
+
+    response = await executor.run("result = 1", 19723)
+
+    assert response.success is False
+    assert response.error_code == "worker_protocol"
+    assert response.error == "Script worker returned a malformed response"
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_parent_rejects_nonstandard_worker_response_constants(
+    executor: ScriptExecutor,
+    constant: str,
+) -> None:
+    payload = (
+        '{"success":true,"result":'
+        + constant
+        + ',"stdout":"","stderr":"","error":null,"error_code":null,'
+        '"execution_model":"local_user","execution_time_ms":1}'
+    ).encode()
+
+    response = executor._parse_response(payload, time.monotonic())
+
+    assert response.success is False
+    assert response.error_code == "worker_protocol"
+    assert response.error == "Script worker returned a malformed response"
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_worker_rejects_nonstandard_request_constants(
+    monkeypatch: pytest.MonkeyPatch,
+    constant: str,
+) -> None:
+    stdin = io.TextIOWrapper(
+        io.BytesIO(f'{{"script":"result = 1","port":{constant}}}'.encode()),
+        encoding="utf-8",
+    )
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(worker_module, "_emit_response", emitted.append)
+
+    worker_module.main()
+
+    assert len(emitted) == 1
+    assert emitted[0]["success"] is False
+    assert emitted[0]["error_code"] == "worker_protocol"
+
+
+async def test_worker_uses_fresh_loopback_archicad_connection(
+    executor: ScriptExecutor,
+    fake_archicad_port: int,
+) -> None:
+    script = """
+native = await archicad.command("GetProductInfo")
+tapir = await archicad.tapir("Echo", {"value": 7})
+result = {"version": native["version"], "echo": tapir["echo"]}
 """
-        res = await executor.run(script, mock_connection)
+    response = await executor.run(script, fake_archicad_port, timeout_seconds=5)
 
-        assert res.success is True
-        assert res.result == '{"a": 1}'
-
-    async def test_math_module(self, executor: ScriptExecutor, mock_connection: MagicMock) -> None:
-        """math module is available."""
-        script = """
-import math
-result = math.sqrt(16)
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == 4.0
-
-    async def test_path_available(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Path is directly available."""
-        script = """
-p = Path("test/file.txt")
-result = str(p.name)
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == "file.txt"
-
-    async def test_itertools_module(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """itertools module is available."""
-        script = """
-import itertools
-result = list(itertools.islice(range(100), 5))
-"""
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == [0, 1, 2, 3, 4]
-
-
-class TestPortVariable:
-    """Tests for port variable access."""
-
-    async def test_port_available(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """port variable is available in script."""
-        script = "result = port"
-        res = await executor.run(script, mock_connection)
-
-        assert res.success is True
-        assert res.result == 19723
-
-
-class TestExecutionTime:
-    """Tests for execution time tracking."""
-
-    async def test_execution_time_recorded(
-        self, executor: ScriptExecutor, mock_connection: MagicMock
-    ) -> None:
-        """Execution time is recorded in milliseconds."""
-        script = "result = 1"
-        res = await executor.run(script, mock_connection)
-
-        assert res.execution_time_ms >= 0
-        assert isinstance(res.execution_time_ms, int)
+    assert response.success is True
+    assert response.result == {"version": "test-version", "echo": {"value": 7}}
