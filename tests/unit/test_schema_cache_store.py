@@ -153,17 +153,21 @@ def test_claim_lease_is_unique_and_stale_only_past_the_bound() -> None:
     first = cs.claim_lease()
     second = cs.claim_lease()
     assert first.id != second.id
-    fresh = cs.CacheLease(id=str(uuid.uuid4()), wall=time.time(), monotonic=time.monotonic())
+    # Fixed exactly representable timestamps: live clock values once rounded
+    # the nominal exact-bound subtraction slightly past 90.0 on Windows.
+    # Production compares with strict >, so the exact bound stays fresh and
+    # only one step past it goes stale on both clock dimensions.
+    fresh = cs.CacheLease(id=str(uuid.uuid4()), wall=1000.0, monotonic=100.0)
     assert not cs.lease_is_stale(
         fresh,
         now_wall=fresh.wall + cs.LEASE_STALE_SECONDS,
         now_monotonic=fresh.monotonic + cs.LEASE_STALE_SECONDS,
     )
-    stale = cs.CacheLease(id=str(uuid.uuid4()), wall=10.0, monotonic=1.0)
+    stale = cs.CacheLease(id=str(uuid.uuid4()), wall=1000.0, monotonic=100.0)
     assert cs.lease_is_stale(
         stale,
-        now_wall=stale.wall + cs.LEASE_STALE_SECONDS + 1.0,
-        now_monotonic=time.monotonic(),
+        now_wall=fresh.wall + cs.LEASE_STALE_SECONDS + 1.0,
+        now_monotonic=fresh.monotonic + cs.LEASE_STALE_SECONDS + 1.0,
     )
 
 
