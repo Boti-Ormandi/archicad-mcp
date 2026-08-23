@@ -182,6 +182,7 @@ def cache_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     root = tmp_path / "cache-root"
     root.mkdir()
     monkeypatch.setenv("LOCALAPPDATA", str(root))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root))
     monkeypatch.delenv("USERPROFILE", raising=False)
     monkeypatch.delenv("ARCHICAD_MCP_OFFLINE", raising=False)
     monkeypatch.delenv("ARCHICAD_MCP_AUTO_UPDATE", raising=False)

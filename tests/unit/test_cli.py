@@ -30,7 +30,7 @@ def isolated_cache_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path
     root = tmp_path / "cache-root"
     root.mkdir()
     monkeypatch.setenv("LOCALAPPDATA", str(root))
-    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root))
     return root
 
 
