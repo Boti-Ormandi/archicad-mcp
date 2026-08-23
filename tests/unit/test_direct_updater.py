@@ -182,6 +182,7 @@ def cache_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     root = tmp_path / "cache-root"
     root.mkdir()
     monkeypatch.setenv("LOCALAPPDATA", str(root))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root))
     monkeypatch.delenv("USERPROFILE", raising=False)
     monkeypatch.delenv("ARCHICAD_MCP_OFFLINE", raising=False)
     monkeypatch.delenv("ARCHICAD_MCP_AUTO_UPDATE", raising=False)
@@ -607,14 +608,25 @@ async def test_attempt_timeout_records_failure_and_clears_the_lease(
     packaged: upd.PackagedTapir,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(upd, "ATTEMPT_TIMEOUT_SECONDS", 0.05)
+    # Regression: a 50 ms total budget expired during the real lease claim's
+    # directory/lock/state I/O on loaded filesystems before the fetch ran.
+    # 2.0 s covers that claim I/O with wide margin (the updater's own bounded
+    # cleanup budget for the same class of work), and the entry witness proves
+    # the deadline fired from the intended post-claim fetch window.
+    entered = asyncio.Event()
 
     async def slow_fetch(url: str, maximum: int) -> FetchOutcome:
         del url, maximum
-        await asyncio.sleep(5.0)
+        entered.set()
+        await asyncio.sleep(30.0)
         raise AssertionError("must be cancelled by the attempt timeout")
 
-    outcome = await upd.run_update_check(packaged, fetch=slow_fetch, manual=True)
+    monkeypatch.setattr(upd, "ATTEMPT_TIMEOUT_SECONDS", 2.0)
+    task = asyncio.ensure_future(upd.run_update_check(packaged, fetch=slow_fetch, manual=True))
+    while not entered.is_set() and not task.done():
+        await asyncio.sleep(0.01)
+    assert entered.is_set(), "attempt deadline expired before the fetch was entered"
+    outcome = await task
     assert outcome == upd.UpdateOutcome("failed", "attempt-timeout")
     state = cs.load_check_state()
     assert state.lease is None
@@ -898,15 +910,23 @@ async def test_cancellation_and_timeout_repetitions_never_mutate_late(
         assert not cs.snapshot_path().exists(), f"late write in cancellation round {round_index}"
         assert cs.load_check_state().lease is None
 
-    monkeypatch.setattr(upd, "ATTEMPT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(upd, "ATTEMPT_TIMEOUT_SECONDS", 2.0)
     for round_index in range(3):
+        entered: asyncio.Event = asyncio.Event()
 
-        async def slow_fetch(url: str, maximum: int) -> FetchOutcome:
+        async def slow_fetch(
+            url: str, maximum: int, *, entered: asyncio.Event = entered
+        ) -> FetchOutcome:
             del url, maximum
-            await asyncio.sleep(5.0)
+            entered.set()
+            await asyncio.sleep(30.0)
             raise AssertionError("must be cancelled by the attempt timeout")
 
-        outcome = await upd.run_update_check(packaged, fetch=slow_fetch, manual=True)
+        task = asyncio.ensure_future(upd.run_update_check(packaged, fetch=slow_fetch, manual=True))
+        while not entered.is_set() and not task.done():
+            await asyncio.sleep(0.01)
+        assert entered.is_set(), f"deadline expired before entry in round {round_index}"
+        outcome = await task
         assert outcome == upd.UpdateOutcome("failed", "attempt-timeout"), round_index
         state = cs.load_check_state()
         assert state.lease is None and state.last_outcome == "failed"
