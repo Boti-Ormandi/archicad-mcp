@@ -18,26 +18,270 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
 
-      - name: Install uv
-        run: python -m pip install uv
+      - name: Install uv 0.12.5
+        run: python -m pip install --disable-pip-version-check "uv==0.12.5"
+
+      - name: Verify dependency lock
+        run: uv lock --check
 
       - name: Sync dependencies
-        run: uv sync --all-extras --dev
+        run: uv sync --frozen --all-extras --dev
 
       - name: Lint
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests scripts
 
       - name: Format
-        run: uv run ruff format --check src tests
+        run: uv run ruff format --check src tests scripts
 
-      - name: Type check
+      - name: Type check product source
         run: uv run mypy src
+
+      - name: Type check release tooling
+        env:
+          MYPYPATH: src
+        run: uv run mypy --explicit-package-bases scripts/verify_release_artifacts.py scripts/generate_tapir_snapshot.py scripts/release_operations.py tests/unit/test_release_artifacts.py tests/unit/test_release_operations.py
 
       - name: Test
         run: uv run pytest -q
+
+  native-state-transactions:
+    name: Native state transactions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv 0.12.5
+        run: python -m pip install --disable-pip-version-check "uv==0.12.5"
+
+      - name: Sync frozen dependencies
+        run: uv sync --frozen --all-extras --dev
+
+      - name: Exercise native cache store transactions
+        run: uv run pytest -q tests/unit/test_schema_cache_store.py
+
+  artifact-smoke:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UV_LINK_MODE: copy
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install uv 0.12.5
+        run: python -m pip install --disable-pip-version-check "uv==0.12.5"
+
+      - name: Verify dependency lock
+        run: uv lock --check
+
+      - name: Prime locked runtime dependency cache
+        run: uv sync --frozen --all-extras --dev
+
+      - name: Prove constrained builds are byte-identical across independent caches
+        run: |
+          set -euo pipefail
+          cache_a="$RUNNER_TEMP/archicad-mcp-build-cache-a"
+          cache_b="$RUNNER_TEMP/archicad-mcp-build-cache-b"
+          dist_a="$RUNNER_TEMP/archicad-mcp-dist-a"
+          dist_b="$RUNNER_TEMP/archicad-mcp-dist-b"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+
+          UV_CACHE_DIR="$cache_a" uv build \
+            --build-constraints requirements/build.txt \
+            --require-hashes \
+            --no-create-gitignore \
+            --out-dir "$dist_a"
+          UV_CACHE_DIR="$cache_b" uv build \
+            --build-constraints requirements/build.txt \
+            --require-hashes \
+            --no-create-gitignore \
+            --out-dir "$dist_b"
+
+          shopt -s nullglob
+          artifacts_a=("$dist_a"/*)
+          artifacts_b=("$dist_b"/*)
+          (( ${#artifacts_a[@]} == 2 && ${#artifacts_b[@]} == 2 ))
+          for index in 0 1; do
+            test "$(basename "${artifacts_a[$index]}")" = "$(basename "${artifacts_b[$index]}")"
+            cmp "${artifacts_a[$index]}" "${artifacts_b[$index]}"
+            sha256sum "${artifacts_a[$index]}" "${artifacts_b[$index]}"
+          done
+          printf 'SMOKE_DIST_DIR=%s\n' "$dist_a" >> "$GITHUB_ENV"
+
+      - name: Install the constrained wheel offline from the frozen runtime lock
+        env:
+          UV_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          venv_dir="$RUNNER_TEMP/archicad-mcp-smoke-venv"
+          requirements="$RUNNER_TEMP/archicad-mcp-runtime.txt"
+          wheelhouse="$RUNNER_TEMP/archicad-mcp-runtime-wheels"
+          smoke_cwd="$RUNNER_TEMP/archicad-mcp-smoke-cwd"
+
+          mkdir -p "$wheelhouse" "$smoke_cwd"
+          uv export --frozen --offline --no-dev --no-emit-project --format requirements.txt --output-file "$requirements"
+          python -m pip download --disable-pip-version-check --require-hashes --only-binary=:all: --dest "$wheelhouse" --requirement "$requirements"
+          uv venv "$venv_dir" --python "$(command -v python)" --offline
+
+          smoke_python="$venv_dir/bin/python"
+          smoke_console="$venv_dir/bin/archicad-mcp"
+          uv pip sync --python "$smoke_python" --offline --no-index --find-links "$wheelhouse" --require-hashes "$requirements"
+
+          shopt -s nullglob
+          wheels=("$SMOKE_DIST_DIR"/archicad_mcp-*.whl)
+          (( ${#wheels[@]} == 1 ))
+          uv pip install --python "$smoke_python" --offline --no-deps "${wheels[0]}"
+
+          {
+            printf 'SMOKE_PYTHON=%s\n' "$smoke_python"
+            printf 'SMOKE_CONSOLE=%s\n' "$smoke_console"
+            printf 'SMOKE_CWD=%s\n' "$smoke_cwd"
+          } >> "$GITHUB_ENV"
+
+      - name: Smoke installed package and CLI without Archicad
+        env:
+          ARCHICAD_MCP_OFFLINE: "1"
+          PYTHONNOUSERSITE: "1"
+          PYTHONSAFEPATH: "1"
+        run: |
+          set -euo pipefail
+          cd "$SMOKE_CWD"
+
+          "$SMOKE_PYTHON" - <<'PY'
+          import sys
+          from importlib.metadata import distribution
+          from pathlib import Path
+
+          import archicad_mcp
+
+          prefix = Path(sys.prefix).resolve()
+          module_path = Path(archicad_mcp.__file__).resolve()
+          assert module_path.is_relative_to(prefix), (module_path, prefix)
+
+          scripts = [
+              (entry.name, entry.value)
+              for entry in distribution("archicad-mcp").entry_points
+              if entry.group == "console_scripts"
+          ]
+          assert scripts == [("archicad-mcp", "archicad_mcp.cli:main")], scripts
+          PY
+
+          "$SMOKE_CONSOLE" --help >/dev/null
+          "$SMOKE_CONSOLE" --version
+
+          doctor_json="$("$SMOKE_CONSOLE" doctor --json)"
+          DOCTOR_JSON="$doctor_json" "$SMOKE_PYTHON" - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["DOCTOR_JSON"])
+          codes = {check["code"] for check in payload["checks"]}
+          assert "PACKAGE_IMPORT_OK" in codes, codes
+          assert "SCHEMA_READ_OK" in codes, codes
+          assert "ARCHICAD_NOT_FOUND" in codes, codes
+          PY
+
+          status_json="$($SMOKE_CONSOLE schemas status --json)"
+          STATUS_JSON="$status_json" "$SMOKE_PYTHON" - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["STATUS_JSON"])
+          assert isinstance(payload, dict) and bool(payload), payload
+          PY
+
+      - name: Smoke installed stdio MCP protocol
+        env:
+          ARCHICAD_MCP_OFFLINE: "1"
+          PYTHONNOUSERSITE: "1"
+          PYTHONSAFEPATH: "1"
+        run: |
+          set -euo pipefail
+          cd "$SMOKE_CWD"
+
+          "$SMOKE_PYTHON" - <<'PY'
+          import asyncio
+          import os
+
+          from mcp.client import Client
+          from mcp.client.stdio import StdioServerParameters, stdio_client
+
+          EXPECTED_TOOLS = {
+              "list_instances",
+              "get_docs",
+              "get_properties",
+              "execute_script",
+          }
+
+
+          async def main() -> None:
+              child_env = {
+                  "ARCHICAD_MCP_OFFLINE": "1",
+                  "HOME": os.environ["HOME"],
+                  "PATH": os.environ["PATH"],
+                  "PYTHONPATH": "",
+                  "PYTHONNOUSERSITE": "1",
+                  "PYTHONSAFEPATH": "1",
+              }
+              parameters = StdioServerParameters(
+                  command=os.environ["SMOKE_CONSOLE"],
+                  cwd=os.environ["SMOKE_CWD"],
+                  env=child_env,
+              )
+
+              async with Client(
+                  stdio_client(parameters),
+                  read_timeout_seconds=30,
+              ) as client:
+                  assert client.protocol_version
+                  tools = await client.list_tools()
+                  assert len(tools.tools) == 4
+                  assert {tool.name for tool in tools.tools} == EXPECTED_TOOLS
+
+                  docs = await client.call_tool("get_docs")
+                  assert not docs.is_error
+                  assert docs.structured_content is not None
+                  assert docs.structured_content["provider_counts"] == {
+                      "native": 73,
+                      "tapir": 236,
+                  }
+
+
+          asyncio.run(main())
+          PY

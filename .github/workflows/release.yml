@@ -3,91 +3,654 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact lowercase 40-character commit SHA to build and publish to TestPyPI
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+  cancel-in-progress: false
+  queue: max
+
+env:
+  DIST_ARTIFACT_NAME: release-dist-${{ github.run_id }}
+  UV_VERSION: "0.12.5"
+  TWINE_VERSION: "7.0.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_digest: ${{ steps.lineage.outputs.artifact_digest }}
+      artifact_id: ${{ steps.lineage.outputs.artifact_id }}
+      artifact_set_sha256: ${{ steps.verify.outputs.artifact_set_sha256 }}
+      release_kind: ${{ steps.source.outputs.release_kind }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      tag: ${{ steps.source.outputs.tag }}
+      tag_object_sha: ${{ steps.source.outputs.tag_object_sha }}
+      version: ${{ steps.verify.outputs.version }}
+
     steps:
-      - uses: actions/checkout@v7
+      - name: Check out the requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
 
-      - uses: actions/setup-python@v7
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install uv
-        run: python -m pip install uv
+      - name: Install pinned release tools
+        run: python -m pip install --disable-pip-version-check "uv==$UV_VERSION" "twine==$TWINE_VERSION"
 
-      - name: Build sdist and wheel
-        run: uv build
-
-      - name: Check artifacts
+      - name: Verify the exact current release source
+        id: source
+        shell: bash
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
         run: |
-          python -m pip install twine
-          twine check dist/*
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
 
-      - uses: actions/upload-artifact@v7
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            if [[ "$GITHUB_REF_TYPE" != "tag" || ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Production requires an exact stable SemVer tag." >&2
+              exit 1
+            fi
+            if [[ "$GITHUB_REF" != "refs/tags/$GITHUB_REF_NAME" || "$head_sha" != "$GITHUB_SHA" ]]; then
+              echo "The checked-out source does not match the pushed tag event." >&2
+              exit 1
+            fi
+            {
+              printf 'release_kind=production\n'
+              printf 'tag=%s\n' "$GITHUB_REF_NAME"
+            } >> "$GITHUB_OUTPUT"
+            python scripts/release_operations.py verify-source \
+              --repository-dir . \
+              --tag "$GITHUB_REF_NAME" \
+              --source-sha "$head_sha" \
+              --github-output "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ || "$head_sha" != "$REQUESTED_REF" ]]; then
+              echo "TestPyPI dispatch requires and must check out an exact lowercase commit SHA." >&2
+              exit 1
+            fi
+            {
+              printf 'release_kind=testpypi\n'
+              printf 'source_sha=%s\n' "$head_sha"
+              printf 'tag=\n'
+              printf 'tag_object_sha=\n'
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported release event: $GITHUB_EVENT_NAME" >&2
+            exit 1
+          fi
+
+      - name: Discover an existing immutable artifact for this run
+        id: existing
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/release_operations.py reuse-run-artifact \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --artifact-name "$DIST_ARTIFACT_NAME" \
+            --expected-workflow-head-sha "${{ github.sha }}" \
+            --dist-dir dist \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify dependency lock
+        run: uv lock --check
+
+      - name: Sync frozen release-quality dependencies
+        run: uv sync --frozen --all-extras --dev
+
+      - name: Lint source and release tooling
+        run: uv run ruff check src tests scripts
+
+      - name: Check source and release tooling formatting
+        run: uv run ruff format --check src tests scripts
+
+      - name: Type check product source
+        run: uv run mypy src
+
+      - name: Type check release tooling
+        run: uv run mypy --explicit-package-bases scripts/verify_release_artifacts.py scripts/release_operations.py tests/unit/test_release_artifacts.py tests/unit/test_release_operations.py
+
+      - name: Run non-integration tests
+        env:
+          ARCHICAD_MCP_OFFLINE: "1"
+        run: uv run pytest -q -m "not integration"
+
+      - name: Recheck production source immediately before building
+        if: steps.existing.outputs.found != 'true' && steps.source.outputs.release_kind == 'production'
+        run: |
+          python scripts/release_operations.py verify-source \
+            --repository-dir . \
+            --tag "${{ steps.source.outputs.tag }}" \
+            --source-sha "${{ steps.source.outputs.source_sha }}" \
+            --expected-tag-object-sha "${{ steps.source.outputs.tag_object_sha }}"
+
+      - name: Build the constrained wheel and source distribution once
+        if: steps.existing.outputs.found != 'true'
+        run: |
+          set -euo pipefail
+          test ! -e dist
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          uv build \
+            --build-constraints requirements/build.txt \
+            --require-hashes \
+            --no-create-gitignore \
+            --out-dir dist
+
+      - name: Verify embedded metadata and artifact identity
+        id: verify
+        env:
+          RELEASE_KIND: ${{ steps.source.outputs.release_kind }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+        run: |
+          set -euo pipefail
+          args=(
+            --dist-dir dist
+            --project-name archicad-mcp
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [[ "$RELEASE_KIND" == "production" ]]; then
+            args+=(--tag "$RELEASE_TAG")
+          fi
+          python scripts/verify_release_artifacts.py "${args[@]}"
+
+      - name: Check distribution descriptions
+        run: twine check --strict dist/*
+
+      - name: Upload the immutable release artifact set once
+        if: steps.existing.outputs.found != 'true'
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: dist
+          name: ${{ env.DIST_ARTIFACT_NAME }}
           path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
 
-  publish-testpypi:
-    if: github.event_name == 'workflow_dispatch'
+      - name: Emit the exact artifact lineage
+        id: lineage
+        shell: bash
+        env:
+          EXISTING_DIGEST: ${{ steps.existing.outputs.artifact_digest }}
+          EXISTING_ID: ${{ steps.existing.outputs.artifact_id }}
+          REUSED: ${{ steps.existing.outputs.found }}
+          UPLOADED_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          UPLOADED_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          if [[ "$REUSED" == "true" ]]; then
+            artifact_id="$EXISTING_ID"
+            artifact_digest="$EXISTING_DIGEST"
+          else
+            artifact_id="$UPLOADED_ID"
+            artifact_digest="$UPLOADED_DIGEST"
+          fi
+          if [[ ! "$artifact_id" =~ ^[1-9][0-9]*$ || ! "$artifact_digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Artifact lineage outputs are missing or malformed." >&2
+            exit 1
+          fi
+          {
+            printf 'artifact_id=%s\n' "$artifact_id"
+            printf 'artifact_digest=%s\n' "$artifact_digest"
+          } >> "$GITHUB_OUTPUT"
+
+  installed-artifact:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UV_LINK_MODE: copy
+
+    steps:
+      - name: Check out the exact built source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.source_sha }}
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install uv 0.12.5
+        run: python -m pip install --disable-pip-version-check "uv==$UV_VERSION"
+
+      - name: Download the exact release artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: dist/
+          digest-mismatch: error
+
+      - name: Reverify downloaded artifact identity and product digest
+        id: verify
+        env:
+          EXPECTED_ARTIFACT_SET: ${{ needs.build.outputs.artifact_set_sha256 }}
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          args=(
+            --dist-dir dist
+            --project-name archicad-mcp
+            --expected-version "$EXPECTED_VERSION"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [[ -n "$RELEASE_TAG" ]]; then
+            args+=(--tag "$RELEASE_TAG")
+          fi
+          python scripts/verify_release_artifacts.py "${args[@]}"
+          actual="$(awk -F= '$1 == "artifact_set_sha256" { value=$2 } END { print value }' "$GITHUB_OUTPUT")"
+          test "$actual" = "$EXPECTED_ARTIFACT_SET"
+
+      - name: Install the wheel in a clean external environment
+        env:
+          WHEEL_NAME: ${{ steps.verify.outputs.wheel }}
+        run: |
+          set -euo pipefail
+          uv lock --check
+
+          venv_dir="$RUNNER_TEMP/archicad-mcp-release-venv"
+          requirements="$RUNNER_TEMP/archicad-mcp-runtime.txt"
+          wheelhouse="$RUNNER_TEMP/archicad-mcp-runtime-wheels"
+          smoke_cwd="$RUNNER_TEMP/archicad-mcp-release-cwd"
+          mkdir "$wheelhouse" "$smoke_cwd"
+
+          uv export --frozen --no-dev --no-emit-project --format requirements.txt --output-file "$requirements"
+          python -m pip download --disable-pip-version-check --require-hashes --only-binary=:all: --dest "$wheelhouse" --requirement "$requirements"
+          uv venv "$venv_dir" --python "$(command -v python)" --offline
+          uv pip sync --python "$venv_dir/bin/python" --offline --no-index --find-links "$wheelhouse" --require-hashes "$requirements"
+          uv pip install --python "$venv_dir/bin/python" --offline --no-deps "$GITHUB_WORKSPACE/dist/$WHEEL_NAME"
+
+          {
+            printf 'SMOKE_PYTHON=%s\n' "$venv_dir/bin/python"
+            printf 'SMOKE_CONSOLE=%s\n' "$venv_dir/bin/archicad-mcp"
+            printf 'SMOKE_CWD=%s\n' "$smoke_cwd"
+            printf 'SMOKE_EXPECTED_VERSION=%s\n' "${{ needs.build.outputs.version }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Smoke installed package, command, and offline doctor
+        env:
+          ARCHICAD_MCP_OFFLINE: "1"
+          PYTHONNOUSERSITE: "1"
+          PYTHONSAFEPATH: "1"
+        run: |
+          set -euo pipefail
+          cd "$SMOKE_CWD"
+
+          "$SMOKE_PYTHON" - <<'PY'
+          import os
+          import sys
+          from importlib.metadata import distribution
+          from pathlib import Path
+
+          import archicad_mcp
+
+          installed = distribution("archicad-mcp")
+          assert installed.version == os.environ["SMOKE_EXPECTED_VERSION"]
+          prefix = Path(sys.prefix).resolve()
+          module_path = Path(archicad_mcp.__file__).resolve()
+          assert module_path.is_relative_to(prefix), (module_path, prefix)
+          scripts = [
+              (entry.name, entry.value)
+              for entry in installed.entry_points
+              if entry.group == "console_scripts"
+          ]
+          assert scripts == [("archicad-mcp", "archicad_mcp.cli:main")], scripts
+          PY
+
+          "$SMOKE_CONSOLE" --help >/dev/null
+          version_output="$("$SMOKE_CONSOLE" --version)"
+          test "$version_output" = "archicad-mcp $SMOKE_EXPECTED_VERSION"
+
+          doctor_json="$("$SMOKE_CONSOLE" doctor --json)"
+          DOCTOR_JSON="$doctor_json" "$SMOKE_PYTHON" - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["DOCTOR_JSON"])
+          codes = {check["code"] for check in payload["checks"]}
+          assert payload["status"] == "warning"
+          assert {"PACKAGE_IMPORT_OK", "SCHEMA_READ_OK", "ARCHICAD_NOT_FOUND"} <= codes
+          PY
+
+          status_json="$($SMOKE_CONSOLE schemas status --json)"
+          STATUS_JSON="$status_json" "$SMOKE_PYTHON" - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ["STATUS_JSON"])
+          assert isinstance(payload, dict) and bool(payload), payload
+          PY
+
+      - name: Smoke modern stdio initialization and exact tool catalog
+        env:
+          ARCHICAD_MCP_OFFLINE: "1"
+          PYTHONNOUSERSITE: "1"
+          PYTHONSAFEPATH: "1"
+        run: |
+          set -euo pipefail
+          cd "$SMOKE_CWD"
+
+          "$SMOKE_PYTHON" - <<'PY'
+          import asyncio
+          import os
+
+          from mcp.client import Client
+          from mcp.client.stdio import StdioServerParameters, stdio_client
+
+          EXPECTED_TOOLS = {
+              "list_instances",
+              "get_docs",
+              "get_properties",
+              "execute_script",
+          }
+
+
+          async def main() -> None:
+              child_env = {
+                  "ARCHICAD_MCP_OFFLINE": "1",
+                  "HOME": os.environ["HOME"],
+                  "PATH": os.environ["PATH"],
+                  "PYTHONPATH": "",
+                  "PYTHONNOUSERSITE": "1",
+                  "PYTHONSAFEPATH": "1",
+              }
+              parameters = StdioServerParameters(
+                  command=os.environ["SMOKE_CONSOLE"],
+                  cwd=os.environ["SMOKE_CWD"],
+                  env=child_env,
+              )
+              async with Client(
+                  stdio_client(parameters),
+                  read_timeout_seconds=30,
+              ) as client:
+                  assert client.protocol_version
+                  tools = await client.list_tools()
+                  assert len(tools.tools) == 4
+                  assert {tool.name for tool in tools.tools} == EXPECTED_TOOLS
+
+                  docs = await client.call_tool("get_docs")
+                  assert not docs.is_error
+                  assert docs.structured_content is not None
+                  assert docs.structured_content["provider_counts"] == {
+                      "native": 73,
+                      "tapir": 236,
+                  }
+
+
+          asyncio.run(main())
+          PY
+
+  publish-testpypi:
+    if: github.event_name == 'workflow_dispatch' && needs.build.outputs.release_kind == 'testpypi'
+    needs:
+      - build
+      - installed-artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
     environment:
       name: testpypi
       url: https://test.pypi.org/p/archicad-mcp
     permissions:
+      contents: read
       id-token: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist/
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+    steps:
+      - name: Check out the exact built source after approval
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.source_sha }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Download the verified release artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: dist/
+          digest-mismatch: error
+
+      - name: Reverify TestPyPI artifact identity and product digest
+        id: verify
+        env:
+          EXPECTED_ARTIFACT_SET: ${{ needs.build.outputs.artifact_set_sha256 }}
+        run: |
+          set -euo pipefail
+          python scripts/verify_release_artifacts.py \
+            --dist-dir dist \
+            --project-name archicad-mcp \
+            --expected-version "${{ needs.build.outputs.version }}" \
+            --github-output "$GITHUB_OUTPUT"
+          actual="$(awk -F= '$1 == "artifact_set_sha256" { value=$2 } END { print value }' "$GITHUB_OUTPUT")"
+          test "$actual" = "$EXPECTED_ARTIFACT_SET"
+
+      - name: Reconcile TestPyPI and stage only missing exact files
+        id: plan
+        run: |
+          python scripts/release_operations.py reconcile-index \
+            --repository testpypi \
+            --project-name archicad-mcp \
+            --version "${{ needs.build.outputs.version }}" \
+            --dist-dir dist \
+            --wheel "${{ steps.verify.outputs.wheel }}" \
+            --sdist "${{ steps.verify.outputs.sdist }}" \
+            --publish-dir publish-dist \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Publish missing files to TestPyPI with trusted publishing
+        if: steps.plan.outputs.publish_needed == 'true'
+        continue-on-error: true
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: publish-dist/
           repository-url: https://test.pypi.org/legacy/
+          skip-existing: false
+
+      - name: Require the exact complete TestPyPI release after bounded retries
+        run: |
+          python scripts/release_operations.py reconcile-index \
+            --repository testpypi \
+            --project-name archicad-mcp \
+            --version "${{ needs.build.outputs.version }}" \
+            --dist-dir dist \
+            --wheel "${{ steps.verify.outputs.wheel }}" \
+            --sdist "${{ steps.verify.outputs.sdist }}" \
+            --require-complete \
+            --attempts 8 \
+            --retry-delay 5
 
   publish-pypi:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.build.outputs.release_kind == 'production'
+    needs:
+      - build
+      - installed-artifact
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     environment:
       name: pypi
       url: https://pypi.org/p/archicad-mcp
     permissions:
+      contents: read
       id-token: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist/
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+    steps:
+      - name: Check out the exact built source after approval
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.source_sha }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Download the verified release artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: dist/
+          digest-mismatch: error
+
+      - name: Reverify current tag and master after environment approval
+        run: |
+          python scripts/release_operations.py verify-source \
+            --repository-dir . \
+            --tag "${{ needs.build.outputs.tag }}" \
+            --source-sha "${{ needs.build.outputs.source_sha }}" \
+            --expected-tag-object-sha "${{ needs.build.outputs.tag_object_sha }}"
+
+      - name: Reverify PyPI artifact identity and product digest
+        id: verify
+        env:
+          EXPECTED_ARTIFACT_SET: ${{ needs.build.outputs.artifact_set_sha256 }}
+        run: |
+          set -euo pipefail
+          python scripts/verify_release_artifacts.py \
+            --dist-dir dist \
+            --project-name archicad-mcp \
+            --tag "${{ needs.build.outputs.tag }}" \
+            --expected-version "${{ needs.build.outputs.version }}" \
+            --github-output "$GITHUB_OUTPUT"
+          actual="$(awk -F= '$1 == "artifact_set_sha256" { value=$2 } END { print value }' "$GITHUB_OUTPUT")"
+          test "$actual" = "$EXPECTED_ARTIFACT_SET"
+
+      - name: Reconcile PyPI and stage only missing exact files
+        id: plan
+        run: |
+          python scripts/release_operations.py reconcile-index \
+            --repository pypi \
+            --project-name archicad-mcp \
+            --version "${{ needs.build.outputs.version }}" \
+            --dist-dir dist \
+            --wheel "${{ steps.verify.outputs.wheel }}" \
+            --sdist "${{ steps.verify.outputs.sdist }}" \
+            --publish-dir publish-dist \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Reverify current tag and master immediately before publication
+        run: |
+          python scripts/release_operations.py verify-source \
+            --repository-dir . \
+            --tag "${{ needs.build.outputs.tag }}" \
+            --source-sha "${{ needs.build.outputs.source_sha }}" \
+            --expected-tag-object-sha "${{ needs.build.outputs.tag_object_sha }}"
+
+      - name: Publish missing files to PyPI with trusted publishing
+        if: steps.plan.outputs.publish_needed == 'true'
+        continue-on-error: true
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: publish-dist/
+          skip-existing: false
+
+      - name: Require the exact complete PyPI release after bounded retries
+        run: |
+          python scripts/release_operations.py reconcile-index \
+            --repository pypi \
+            --project-name archicad-mcp \
+            --version "${{ needs.build.outputs.version }}" \
+            --dist-dir dist \
+            --wheel "${{ steps.verify.outputs.wheel }}" \
+            --sdist "${{ steps.verify.outputs.sdist }}" \
+            --require-complete \
+            --attempts 8 \
+            --retry-delay 5
 
   github-release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: publish-pypi
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.build.outputs.release_kind == 'production'
+    needs:
+      - build
+      - publish-pypi
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     permissions:
       contents: write
+
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/download-artifact@v8
+      - name: Check out release notes from the exact built source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: dist
-          path: dist/
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: ${{ needs.build.outputs.source_sha }}
 
-      - name: Create GitHub Release
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Download the published release artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: dist/
+          digest-mismatch: error
+
+      - name: Reverify release artifact identity and product digest
+        id: verify
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
+          EXPECTED_ARTIFACT_SET: ${{ needs.build.outputs.artifact_set_sha256 }}
+        run: |
+          set -euo pipefail
+          python scripts/verify_release_artifacts.py \
+            --dist-dir dist \
+            --project-name archicad-mcp \
+            --tag "${{ needs.build.outputs.tag }}" \
+            --expected-version "${{ needs.build.outputs.version }}" \
+            --github-output "$GITHUB_OUTPUT"
+          actual="$(awk -F= '$1 == "artifact_set_sha256" { value=$2 } END { print value }' "$GITHUB_OUTPUT")"
+          test "$actual" = "$EXPECTED_ARTIFACT_SET"
+
+      - name: Reverify current tag and master immediately before release mutation
+        run: |
+          python scripts/release_operations.py verify-source \
+            --repository-dir . \
+            --tag "${{ needs.build.outputs.tag }}" \
+            --source-sha "${{ needs.build.outputs.source_sha }}" \
+            --expected-tag-object-sha "${{ needs.build.outputs.tag_object_sha }}"
+
+      - name: Create or resume the exact draft-first GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/release_operations.py github-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "${{ needs.build.outputs.tag }}" \
+            --source-sha "${{ needs.build.outputs.source_sha }}" \
+            --dist-dir dist \
+            --wheel "${{ steps.verify.outputs.wheel }}" \
+            --sdist "${{ steps.verify.outputs.sdist }}" \
+            --curated-notes "docs/releases/${{ needs.build.outputs.tag }}.md"

@@ -7,22 +7,13 @@
     "enabled": true,
     "automerge": true
   },
-  "git-submodules": {
-    "enabled": true
+  "pip_requirements": {
+    "managerFilePatterns": [
+      "/(^|/)[\\w-]*requirements([-._]\\w+)?\\.(txt|pip)$/",
+      "/(^|/)requirements/build\\.txt$/"
+    ]
   },
   "packageRules": [
-    {
-      "matchManagers": ["git-submodules"],
-      "matchDepNames": ["deps/tapir"],
-      "groupName": "tapir schemas",
-      "automerge": true
-    },
-    {
-      "matchManagers": ["git-submodules"],
-      "matchDepNames": ["deps/multiconn"],
-      "groupName": "builtin schemas",
-      "automerge": true
-    },
     {
       "matchManagers": ["pep621"],
       "rangeStrategy": "update-lockfile"
@@ -34,7 +25,28 @@
     },
     {
       "matchManagers": ["github-actions"],
-      "automerge": true
+      "pinDigests": true,
+      "automerge": false
+    },
+    {
+      "matchManagers": ["pip_requirements"],
+      "matchFileNames": ["requirements/build.txt"],
+      "automerge": false
+    },
+    {
+      "matchDepNames": [
+        "hatch-vcs",
+        "hatchling",
+        "packaging",
+        "pathspec",
+        "pluggy",
+        "setuptools",
+        "setuptools-scm",
+        "tomlkit",
+        "trove-classifiers",
+        "vcs-versioning"
+      ],
+      "automerge": false
     },
     {
       "matchDepNames": ["python"],
