@@ -2120,6 +2120,11 @@
         "$ref": "#/$defs/AddOnCommandIdArrayItem"
       }
     },
+    "AddOnCommandParameters": {
+      "type": "object",
+      "description": "The input parameters of an Add-On command.",
+      "additionalProperties": true
+    },
     "AddOnCommandResponse": {
       "type": "object",
       "description": "The response returned by an Add-On command.",
@@ -2348,6 +2353,40 @@
       "items": {
         "$ref": "#/$defs/AttributeFolderOrError"
       }
+    },
+    "AttributeFolderCreationParameters": {
+      "type": "object",
+      "description": "Used to create an attribute folder. The folder type and it's path needs to be provided.",
+      "properties": {
+        "attributeType": {
+          "$ref": "#/$defs/AttributeType"
+        },
+        "path": {
+          "$ref": "#/$defs/AttributeFolderPath"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "attributeType",
+        "path"
+      ]
+    },
+    "AttributeFolderRenameParameters": {
+      "type": "object",
+      "description": "Used to rename an attribute folder. The folder is identified by it's Id.",
+      "properties": {
+        "attributeFolderId": {
+          "$ref": "#/$defs/AttributeFolderId"
+        },
+        "newName": {
+          "$ref": "#/$defs/AttributeFolderName"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "attributeFolderId",
+        "newName"
+      ]
     },
     "AttributeFolderStructureArrayItem": {
       "type": "object",
@@ -5907,6 +5946,55 @@
         "error"
       ]
     },
+    "SuccessfulExecutionResult": {
+      "type": "object",
+      "description": "The result of a successful execution.",
+      "properties": {
+        "success": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "success"
+      ]
+    },
+    "FailedExecutionResult": {
+      "type": "object",
+      "description": "The result of a failed execution.",
+      "properties": {
+        "success": {
+          "type": "boolean",
+          "enum": [
+            false
+          ]
+        },
+        "error": {
+          "$ref": "#/$defs/Error",
+          "description": "The details of an execution failure."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "success",
+        "error"
+      ]
+    },
+    "ExecutionResult": {
+      "type": "object",
+      "description": "The result of the execution.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SuccessfulExecutionResult"
+        },
+        {
+          "$ref": "#/$defs/FailedExecutionResult"
+        }
+      ]
+    },
     "ExecutionResults": {
       "type": "array",
       "description": "A list of execution results.",
@@ -6108,6 +6196,20 @@
       "items": {
         "$ref": "#/$defs/ImageOrError"
       }
+    },
+    "FolderParameters": {
+      "type": "object",
+      "description": "The parameters of a folder.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The name of the folder."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
     },
     "BoundingBox2D": {
       "type": "object",
@@ -6342,6 +6444,95 @@
         "numberingStyle",
         "startAt",
         "ownPrefix"
+      ]
+    },
+    "LayoutParameters": {
+      "type": "object",
+      "description": "The parameters of the layout.",
+      "properties": {
+        "horizontalSize": {
+          "type": "number",
+          "description": "The horizontal size of the layout in millimeters."
+        },
+        "verticalSize": {
+          "type": "number",
+          "description": "The vertical size of the layout in millimeters."
+        },
+        "leftMargin": {
+          "type": "number",
+          "description": "The layout margin from the left side of the paper."
+        },
+        "topMargin": {
+          "type": "number",
+          "description": "The layout margin from the top side of the paper."
+        },
+        "rightMargin": {
+          "type": "number",
+          "description": "The layout margin from the right side of the paper."
+        },
+        "bottomMargin": {
+          "type": "number",
+          "description": "The layout margin from the bottom side of the paper."
+        },
+        "customLayoutNumber": {
+          "type": "string",
+          "description": "The custom ID."
+        },
+        "customLayoutNumbering": {
+          "type": "boolean",
+          "description": "Defines whether a unique ID is used for the current layout or not."
+        },
+        "doNotIncludeInNumbering": {
+          "type": "boolean",
+          "description": "Defines whether this layout is included in automatic ID assignment or not."
+        },
+        "displayMasterLayoutBelow": {
+          "type": "boolean",
+          "description": "Defines whether to display the master layout above or below the layout."
+        },
+        "layoutPageNumber": {
+          "type": "integer",
+          "description": "The page number of layout when this layout contains multi-page drawings."
+        },
+        "actPageIndex": {
+          "type": "integer",
+          "description": "The actual index of layout inside the multi-page layout."
+        },
+        "currentRevisionId": {
+          "type": "string",
+          "description": "The ID of the current document revision of the layout."
+        },
+        "currentFinalRevisionId": {
+          "type": "string",
+          "description": "The ID with optional suffix of the current document revision of the layout."
+        },
+        "hasIssuedRevision": {
+          "type": "boolean",
+          "description": "Defines whether one or more issued document revisions have already been created for the layout or not."
+        },
+        "hasActualRevision": {
+          "type": "boolean",
+          "description": "Defines whether an open document revision exists for the layout or not."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "horizontalSize",
+        "verticalSize",
+        "leftMargin",
+        "topMargin",
+        "rightMargin",
+        "bottomMargin",
+        "customLayoutNumber",
+        "customLayoutNumbering",
+        "doNotIncludeInNumbering",
+        "displayMasterLayoutBelow",
+        "layoutPageNumber",
+        "actPageIndex",
+        "currentRevisionId",
+        "currentFinalRevisionId",
+        "hasIssuedRevision",
+        "hasActualRevision"
       ]
     },
     "ComponentId": {

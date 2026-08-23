@@ -20,11 +20,12 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=2,<3",
     "aiohttp>=3.9.0",
     "pydantic>=2.0.0",
     "openpyxl>=3.1.0",
     "rapidfuzz>=3.0.0",
+    "filelock>=3.32.2,<4",
 ]
 
 [project.urls]
@@ -43,8 +44,7 @@ dev = [
 ]
 
 [project.scripts]
-archicad-mcp = "archicad_mcp.server:main"
-archicad-mcp-sync = "archicad_mcp.schemas.cache:sync_cli"
+archicad-mcp = "archicad_mcp.cli:main"
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

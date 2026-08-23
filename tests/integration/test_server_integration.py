@@ -24,7 +24,7 @@ async def archicad_available() -> int | None:
                     json={"command": "API.IsAlive", "parameters": {}},
                 ) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
+                        data = await resp.json(content_type=None)
                         if data.get("succeeded"):
                             return port
             except (aiohttp.ClientError, TimeoutError):

@@ -31,6 +31,10 @@ class ArchicadConnection:
         # Use tapirAvailable from probing if provided, otherwise None (unknown)
         tapir_val = info.get("tapirAvailable")
         self._tapir_available: bool | None = tapir_val if isinstance(tapir_val, bool) else None
+        raw_tapir_version = info.get("tapirVersion")
+        self.tapir_version: str | None = (
+            raw_tapir_version if isinstance(raw_tapir_version, str) and raw_tapir_version else None
+        )
 
     async def execute(
         self,

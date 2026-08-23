@@ -14,15 +14,30 @@ class ArchicadInstance(BaseModel):
     project_type: Literal["solo", "teamwork", "untitled"]
     archicad_version: str
     is_tapir_available: bool
+    tapir_version: str | None = None
+
+
+ScriptErrorCode = Literal[
+    "syntax_error",
+    "runtime_error",
+    "timeout",
+    "worker_start",
+    "worker_exit",
+    "worker_protocol",
+    "result_not_json",
+]
 
 
 class ScriptResult(BaseModel):
-    """Result of script execution."""
+    """Result of same-account local-user script execution."""
 
     success: bool
     result: Any | None
     stdout: str
+    stderr: str = ""
     error: str | None
+    error_code: ScriptErrorCode | None = None
+    execution_model: Literal["local_user"] = "local_user"
     execution_time_ms: int
 
 
