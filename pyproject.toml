@@ -1,7 +1,7 @@
 [project]
 name = "archicad-mcp"
 dynamic = ["version"]
-description = "MCP server for Archicad automation via the Tapir JSON API"
+description = "MCP server for Archicad automation via Archicad's built-in JSON API, with Tapir add-on support"
 readme = "README.md"
 license = "MIT"
 authors = [{ name = "Botond Ormandi" }]
@@ -29,9 +29,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Boti-Ormandi/archicad-mcp"
+Documentation = "https://github.com/Boti-Ormandi/archicad-mcp#readme"
 Repository = "https://github.com/Boti-Ormandi/archicad-mcp"
 Issues = "https://github.com/Boti-Ormandi/archicad-mcp/issues"
+Changelog = "https://github.com/Boti-Ormandi/archicad-mcp/releases"
 
 [project.optional-dependencies]
 dev = [

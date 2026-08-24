@@ -1,0 +1,74 @@
+name: Bug report
+description: Report a reproducible problem with archicad-mcp
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues before reporting a bug. Do not include credentials, proprietary project data, or other sensitive information.
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include archicad-mcp, Python, operating system, and MCP client versions.
+      placeholder: |
+        archicad-mcp:
+        Python:
+        Operating system:
+        MCP client:
+    validations:
+      required: true
+
+  - type: textarea
+    id: archicad
+    attributes:
+      label: Archicad and Tapir
+      description: For live-operation problems, include the Archicad major, project type, and Tapir version. Otherwise enter "Not applicable."
+      placeholder: |
+        Archicad major:
+        Project type:
+        Tapir version:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest sequence that consistently reproduces the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostic output
+      description: Paste relevant output from `archicad-mcp doctor --json` after removing sensitive information.
+      render: json
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed credentials and sensitive project data.
+          required: true

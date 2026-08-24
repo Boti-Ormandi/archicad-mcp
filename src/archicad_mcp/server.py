@@ -749,7 +749,7 @@ def create_server() -> MCPServer[ServerState]:
     """Build the native MCP SDK v2 server with static tool metadata."""
     server = MCPServer(
         "Archicad MCP",
-        instructions="Powerful Archicad automation via JSON API and Python scripting",
+        instructions="Archicad automation through JSON API commands and Python scripts",
         lifespan=lifespan,
     )
     server.add_tool(list_instances)
