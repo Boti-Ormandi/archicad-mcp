@@ -157,12 +157,16 @@ def _print_setup() -> int:
             }
         }
     }
-    sys.stdout.write("Run directly: uvx archicad-mcp\n\n")
-    sys.stdout.write("MCP client configuration:\n")
+    sys.stdout.write("Add this local stdio server to your MCP client:\n\n")
     sys.stdout.write(json.dumps(snippet, indent=2) + "\n\n")
+    sys.stdout.write("Save the configuration and restart or reload the client.\n")
     sys.stdout.write(
-        "Tapir add-on is required for Tapir commands; Archicad's native JSON API remains available "
-        "for built-in commands.\n"
+        'Verify with get_docs(command="API.GetAllElements"); a successful response has the ID '
+        "native:API.GetAllElements and includes the command schema.\n"
+    )
+    sys.stdout.write(
+        "Live tools require this server and Archicad to run on the same computer. Tapir is optional "
+        "and is needed only for Tapir commands and get_properties.\n"
     )
     return 0
 

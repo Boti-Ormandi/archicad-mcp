@@ -63,12 +63,13 @@ _NATIVE_PROVIDER_VERSION = "2.0.0"
 _PACKAGED_TARGET_IDENTITY = "schema-bundle:native:2.0.0"
 
 EXECUTE_SCRIPT_DESCRIPTION = (
-    "Execute Python in a disposable same-account local_user worker against the selected Archicad "
-    "port. This is reliability isolation only, not hostile-code isolation: scripts have ordinary "
-    "local-user Python builtins and imports and can read or write files, start processes, or make "
-    "destructive Archicad/Tapir changes with the user's authority. The default timeout is 300 "
-    "seconds; any positive finite timeout is accepted and null disables it. Timeout or transport "
-    "cancellation terminates the owned worker. Use get_docs to discover Archicad and Tapir commands."
+    "Run the body of an async Python function against the selected Archicad port. archicad and port "
+    "are injected, and top-level await works. Use archicad.command for native commands and "
+    "archicad.tapir for Tapir commands; use get_docs to inspect their schemas. Assign a "
+    "JSON-compatible value to result; stdout and stderr are captured in ScriptResult. Execution uses "
+    "a local_user worker but is not hostile-code isolation: scripts can make destructive model or "
+    "system changes. The default timeout is 300 seconds; null disables it. Timeout or cancellation "
+    "stops the worker but cannot undo completed effects or guarantee that spawned processes stop."
 )
 
 
@@ -481,6 +482,12 @@ async def get_docs(
       - Partial match: "prop" finds property commands
       - Typo tolerant: "proprty" -> property commands
       - Multi-word: "create slab" finds CreateSlabs
+
+    LIVE VIEW FILTERING:
+      - No live instance: compatibility_unknown; packaged native and Tapir docs are available
+      - Tapir observed: tapir_available; native and Tapir docs are available
+      - Reachable native-only instances: tapir_unavailable; Tapir capabilities are omitted
+      - The live process filters the validated packaged/cached registry; it does not supply schemas
 
     Args:
         search: Search query (e.g., "wall", "create slab", "property")

@@ -178,10 +178,16 @@ def test_setup_is_output_only(
     output = capsys.readouterr().out
     after = _file_snapshot(tmp_path)
     assert before == after
-    assert "uvx archicad-mcp" in output
-    assert '"command": "uvx"' in output
-    assert '"archicad-mcp"' in output
-    assert "Tapir add-on is required" in output
+    json_start = output.index("{")
+    snippet, _end = json.JSONDecoder().raw_decode(output[json_start:])
+    assert snippet == {
+        "mcpServers": {
+            "archicad": {
+                "command": "uvx",
+                "args": ["archicad-mcp"],
+            }
+        }
+    }
 
 
 def test_config_json_is_read_only_exact_and_has_no_gate_fields(

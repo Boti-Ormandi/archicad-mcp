@@ -141,6 +141,13 @@ async def test_installed_console_serves_modern_and_legacy_clients(
                 }
                 assert docs.structured_content["total"] == 309
 
+            first_success = await client.call_tool("get_docs", {"command": "API.GetAllElements"})
+            assert not first_success.is_error
+            assert first_success.structured_content is not None
+            assert first_success.structured_content["id"] == "native:API.GetAllElements"
+            assert "command" in first_success.structured_content
+            assert "$defs" in first_success.structured_content
+
             # Negative targeting is asserted only when discovery found nothing,
             # so the test stays hermetic on machines with live Archicad and
             # never sends operations toward a running model.

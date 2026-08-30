@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Search existing issues before reporting a bug. Do not include credentials, proprietary project data, or other sensitive information.
+        Search existing issues before reporting a bug. This form is public; do not include credentials, proprietary project data, private paths, or sensitive vulnerability details.
 
   - type: textarea
     id: environment
@@ -60,7 +60,7 @@ body:
     id: diagnostics
     attributes:
       label: Diagnostic output
-      description: Paste relevant output from `archicad-mcp doctor --json` after removing sensitive information.
+      description: Paste relevant output from `uvx archicad-mcp doctor --json` (or the bare command after a persistent install) after removing sensitive information.
       render: json
 
   - type: checkboxes
@@ -70,5 +70,5 @@ body:
       options:
         - label: I searched existing issues for this problem.
           required: true
-        - label: I removed credentials and sensitive project data.
+        - label: I removed credentials and other sensitive information.
           required: true

@@ -2,17 +2,17 @@
 
 Contributions should stay focused, preserve the public MCP and CLI contracts, and include verification appropriate to the change.
 
-## Reporting bugs
+## Reporting bugs and vulnerabilities
 
-Search the [existing issues](https://github.com/Boti-Ormandi/archicad-mcp/issues) before filing a bug. Use the bug report form and include:
+Search the [existing issues](https://github.com/Boti-Ormandi/archicad-mcp/issues) before filing a bug. After redacting sensitive information, use the [public bug report form](https://github.com/Boti-Ormandi/archicad-mcp/issues/new?template=bug_report.yml) and include:
 
-- output from `archicad-mcp --version`;
+- output from `uvx archicad-mcp --version`, or the bare command after a persistent install;
 - Python, operating system, and MCP client versions;
 - the Archicad major and Tapir version for live-operation failures;
 - minimal reproduction steps and the expected result; and
-- relevant output from `archicad-mcp doctor --json`.
+- relevant output from `uvx archicad-mcp doctor --json`, or the bare command after a persistent install.
 
-Remove credentials, proprietary project data, and other sensitive information from diagnostics and logs.
+Remove credentials, proprietary project data, private paths, and other sensitive content from diagnostics and logs. Do not post sensitive vulnerability details in a public issue; the project does not currently publish a private reporting channel.
 
 ## Development setup
 
@@ -57,6 +57,8 @@ uv run mypy --explicit-package-bases scripts/verify_release_artifacts.py scripts
 `uv run pre-commit run --all-files` is a useful additional local check, but it does not replace the full CI command set above.
 
 Tests marked `integration` require a running Archicad instance with Tapir and skip when Archicad is unavailable. For faster offline iteration, use `uv run pytest -m "not integration"`; run the complete `uv run pytest -q` suite before opening a pull request.
+
+When changing script execution documentation or tool metadata, keep the safety, authoring, result, and cancellation contract consistent with [docs/script-execution.md](docs/script-execution.md).
 
 ## Schema snapshots
 
