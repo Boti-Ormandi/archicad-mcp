@@ -73,6 +73,34 @@ A deliberate Tapir baseline update must use the pinned upstream files and determ
 - Add or update tests when behavior changes.
 - Update user documentation when commands, configuration, or limitations change.
 - Do not update `uv.lock` unless dependency metadata changed.
-- Do not create or edit `docs/releases/*.md` in an ordinary pull request. Those files are curated inputs to the named release transaction.
+- Do not create new `docs/releases/vX.Y.Z.md` files. The existing `v0.2.0.md` and `v0.2.1.md` files are historical records, not inputs to future releases.
 
-Before requesting review, inspect the complete diff and confirm that generated snapshots, release notes, and unrelated files are unchanged unless the pull request explicitly owns them.
+Before requesting review, inspect the complete diff and confirm that generated snapshots, historical release records, and unrelated files are unchanged unless the pull request explicitly owns them.
+
+## Maintainer release procedure
+
+Production releases use the manual **Release** workflow and a complete release body supplied at dispatch time:
+
+1. Push the reviewed release source to `origin/master`.
+2. Create an annotated exact stable tag (`vX.Y.Z`) at that source and push the tag without moving or replacing an existing stable tag.
+3. Prepare the complete public release body outside `docs/releases/`. The workflow does not append generated notes.
+4. Dispatch the workflow from `master`, selecting `production`, naming the tag, and loading the body from a file:
+
+   ```bash
+   gh workflow run release.yml --ref master -f mode=production -f ref=vX.Y.Z -F release_body=@/path/to/release-body.md
+   ```
+
+5. Review the build, repository tests, installed-artifact tests, and exact artifact lineage. Then approve the `pypi` environment.
+6. Confirm that exact PyPI reconciliation succeeds before the dependent GitHub Release job publishes the same wheel and source distribution.
+
+For a TestPyPI rehearsal, dispatch from `master` with `mode=testpypi`, set `ref` to an exact lowercase 40-character source SHA, and leave `release_body` empty.
+
+### Release retries and recovery
+
+- Never move, replace, or delete a stable release tag.
+- After any possible PyPI or GitHub mutation, rerun all jobs on the same workflow run. This preserves the run ID, retained artifact ID, and exact artifact bytes.
+- Start a new dispatch only when no external mutation could have occurred in the earlier run.
+- If the same run or its artifact has expired after partial publication, stop and reconcile the external PyPI and GitHub state manually. Do not rebuild and continue automatically.
+- A rerun must supply the same body embedded in the original dispatch event. A changed body fails reconciliation against the existing transaction marker without mutating the release.
+
+The workflow creates the GitHub Release as a draft, reconciles its exact assets, and publishes it only after PyPI contains the exact artifact set. Existing exact PyPI files and an exact already-published GitHub Release are idempotent success states.

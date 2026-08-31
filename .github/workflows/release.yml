@@ -1,21 +1,30 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
     inputs:
-      ref:
-        description: Exact lowercase 40-character commit SHA to build and publish to TestPyPI
+      mode:
+        description: Publication target
         required: true
+        type: choice
+        options:
+          - testpypi
+          - production
+        default: testpypi
+      ref:
+        description: Exact stable tag for production or lowercase 40-character SHA for TestPyPI
+        required: true
+        type: string
+      release_body:
+        description: Complete GitHub Release body for production; leave empty for TestPyPI
+        required: false
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+  group: release-${{ github.workflow }}-${{ inputs.mode }}-${{ inputs.ref }}
   cancel-in-progress: false
   queue: max
 
@@ -42,13 +51,75 @@ jobs:
       version: ${{ steps.verify.outputs.version }}
 
     steps:
-      - name: Check out the requested source
+      - name: Validate dispatch and extract the release body
+        id: dispatch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          marker_prefix = "<!-- archicad-mcp-release-transaction:"
+          stable_tag = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+          commit_sha = re.compile(r"^[0-9a-f]{40}$")
+
+          if os.environ.get("GITHUB_REF") != "refs/heads/master":
+              raise SystemExit("Release dispatches must use the workflow from master.")
+          with Path(os.environ["GITHUB_EVENT_PATH"]).open(encoding="utf-8") as stream:
+              event = json.load(stream)
+          inputs = event.get("inputs")
+          if not isinstance(inputs, dict):
+              raise SystemExit("The dispatch event has no valid inputs object.")
+          mode = inputs.get("mode")
+          requested_ref = inputs.get("ref")
+          body = inputs.get("release_body", "")
+          if not all(isinstance(value, str) for value in (mode, requested_ref, body)):
+              raise SystemExit("Release dispatch inputs must be strings.")
+
+          if mode == "production":
+              if stable_tag.fullmatch(requested_ref) is None:
+                  raise SystemExit("Production requires an exact stable vX.Y.Z tag.")
+              try:
+                  body_bytes = body.encode("utf-8", errors="strict")
+              except UnicodeEncodeError as exc:
+                  raise SystemExit("The production release body is not valid UTF-8 text.") from exc
+              if not body or body.isspace():
+                  raise SystemExit("Production requires a nonempty release body.")
+              if len(body_bytes) > 60 * 1024:
+                  raise SystemExit("The production release body exceeds 60 KiB in UTF-8.")
+              if "\r" in body or "\x7f" in body or any(
+                  ord(character) < 32 and character not in {"\n", "\t"}
+                  for character in body
+              ):
+                  raise SystemExit("The production release body contains unsupported controls.")
+              if marker_prefix in body:
+                  raise SystemExit("The production release body contains a reserved marker.")
+          elif mode == "testpypi":
+              if commit_sha.fullmatch(requested_ref) is None:
+                  raise SystemExit("TestPyPI requires an exact lowercase 40-character SHA.")
+              if body != "":
+                  raise SystemExit("TestPyPI dispatches must not supply a release body.")
+          else:
+              raise SystemExit("Unsupported release mode.")
+
+          (Path(os.environ["RUNNER_TEMP"]) / "release-body.md").write_bytes(
+              body.encode("utf-8", errors="strict")
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8", newline="\n") as output:
+              output.write(f"mode={mode}\n")
+              output.write(f"requested_ref={requested_ref}\n")
+          PY
+
+      - name: Check out the validated source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
           persist-credentials: false
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          ref: ${{ steps.dispatch.outputs.requested_ref }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -58,38 +129,42 @@ jobs:
       - name: Install pinned release tools
         run: python -m pip install --disable-pip-version-check "uv==$UV_VERSION" "twine==$TWINE_VERSION"
 
-      - name: Verify the exact current release source
+      - name: Bootstrap and verify the exact release source
         id: source
         shell: bash
         env:
-          REQUESTED_REF: ${{ inputs.ref }}
+          VALIDATED_MODE: ${{ steps.dispatch.outputs.mode }}
+          VALIDATED_REF: ${{ steps.dispatch.outputs.requested_ref }}
         run: |
           set -euo pipefail
           head_sha="$(git rev-parse HEAD)"
-
-          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
-            if [[ "$GITHUB_REF_TYPE" != "tag" || ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              echo "Production requires an exact stable SemVer tag." >&2
+          if [[ "$VALIDATED_MODE" == "production" ]]; then
+            tag_ref="refs/release-validation/bootstrap/tag"
+            master_ref="refs/release-validation/bootstrap/master"
+            git fetch --atomic --no-tags origin \
+              "+refs/tags/$VALIDATED_REF:$tag_ref" \
+              "+refs/heads/master:$master_ref"
+            tag_object_sha="$(git rev-parse --verify "$tag_ref")"
+            if [[ "$(git cat-file -t "$tag_object_sha")" != "tag" ]]; then
+              echo "Production requires an annotated tag object, not a lightweight tag." >&2
               exit 1
             fi
-            if [[ "$GITHUB_REF" != "refs/tags/$GITHUB_REF_NAME" || "$head_sha" != "$GITHUB_SHA" ]]; then
-              echo "The checked-out source does not match the pushed tag event." >&2
+            tag_commit_sha="$(git rev-parse --verify "$tag_ref^{commit}")"
+            if [[ "$tag_commit_sha" != "$head_sha" ]]; then
+              echo "The remote tag does not peel to the checked-out source." >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$head_sha" "$master_ref"; then
+              echo "The release source is not reachable from current origin/master." >&2
               exit 1
             fi
             {
               printf 'release_kind=production\n'
-              printf 'tag=%s\n' "$GITHUB_REF_NAME"
+              printf 'source_sha=%s\n' "$head_sha"
+              printf 'tag=%s\n' "$VALIDATED_REF"
+              printf 'tag_object_sha=%s\n' "$tag_object_sha"
             } >> "$GITHUB_OUTPUT"
-            python scripts/release_operations.py verify-source \
-              --repository-dir . \
-              --tag "$GITHUB_REF_NAME" \
-              --source-sha "$head_sha" \
-              --github-output "$GITHUB_OUTPUT"
-          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ ! "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ || "$head_sha" != "$REQUESTED_REF" ]]; then
-              echo "TestPyPI dispatch requires and must check out an exact lowercase commit SHA." >&2
-              exit 1
-            fi
+          elif [[ "$VALIDATED_MODE" == "testpypi" && "$head_sha" == "$VALIDATED_REF" ]]; then
             {
               printf 'release_kind=testpypi\n'
               printf 'source_sha=%s\n' "$head_sha"
@@ -97,7 +172,7 @@ jobs:
               printf 'tag_object_sha=\n'
             } >> "$GITHUB_OUTPUT"
           else
-            echo "Unsupported release event: $GITHUB_EVENT_NAME" >&2
+            echo "The checked-out source does not match the validated dispatch." >&2
             exit 1
           fi
 
@@ -407,7 +482,7 @@ jobs:
           PY
 
   publish-testpypi:
-    if: github.event_name == 'workflow_dispatch' && needs.build.outputs.release_kind == 'testpypi'
+    if: needs.build.outputs.release_kind == 'testpypi'
     needs:
       - build
       - installed-artifact
@@ -489,7 +564,7 @@ jobs:
             --retry-delay 5
 
   publish-pypi:
-    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.build.outputs.release_kind == 'production'
+    if: needs.build.outputs.release_kind == 'production'
     needs:
       - build
       - installed-artifact
@@ -589,7 +664,7 @@ jobs:
             --retry-delay 5
 
   github-release:
-    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.build.outputs.release_kind == 'production'
+    if: needs.build.outputs.release_kind == 'production'
     needs:
       - build
       - publish-pypi
@@ -599,7 +674,42 @@ jobs:
       contents: write
 
     steps:
-      - name: Check out release notes from the exact built source
+      - name: Re-extract the validated release body
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          if os.environ.get("GITHUB_REF") != "refs/heads/master":
+              raise SystemExit("Release dispatches must use the workflow from master.")
+          with Path(os.environ["GITHUB_EVENT_PATH"]).open(encoding="utf-8") as stream:
+              event = json.load(stream)
+          inputs = event.get("inputs")
+          if not isinstance(inputs, dict) or inputs.get("mode") != "production":
+              raise SystemExit("The GitHub Release job requires a production dispatch.")
+          body = inputs.get("release_body")
+          if not isinstance(body, str):
+              raise SystemExit("The production release body is missing.")
+          try:
+              body_bytes = body.encode("utf-8", errors="strict")
+          except UnicodeEncodeError as exc:
+              raise SystemExit("The production release body is not valid UTF-8 text.") from exc
+          if not body or body.isspace() or len(body_bytes) > 60 * 1024:
+              raise SystemExit("The production release body is empty or exceeds 60 KiB.")
+          if "\r" in body or "\x7f" in body or any(
+              ord(character) < 32 and character not in {"\n", "\t"}
+              for character in body
+          ):
+              raise SystemExit("The production release body contains unsupported controls.")
+          if "<!-- archicad-mcp-release-transaction:" in body:
+              raise SystemExit("The production release body contains a reserved marker.")
+          (Path(os.environ["RUNNER_TEMP"]) / "release-body.md").write_bytes(body_bytes)
+          PY
+
+      - name: Check out the exact built source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -653,4 +763,4 @@ jobs:
             --dist-dir dist \
             --wheel "${{ steps.verify.outputs.wheel }}" \
             --sdist "${{ steps.verify.outputs.sdist }}" \
-            --curated-notes "docs/releases/${{ needs.build.outputs.tag }}.md"
+            --release-body-file "$RUNNER_TEMP/release-body.md"

@@ -40,6 +40,7 @@ _MAX_JSON_BYTES = 16 * 1024 * 1024
 _MAX_ERROR_BYTES = 1024 * 1024
 _MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024
 _MAX_RELEASE_MARKER_BYTES = 64 * 1024
+_MAX_RELEASE_BODY_BYTES = 60 * 1024
 _RELEASE_MARKER_PREFIX = "<!-- archicad-mcp-release-transaction:"
 _RELEASE_MARKER = re.compile(r"<!-- archicad-mcp-release-transaction:v1:([0-9a-f]+) -->")
 
@@ -128,11 +129,10 @@ class ReleaseAssetInventory:
 
 @dataclass(frozen=True)
 class ReleaseContent:
-    """Persisted generated release content recovered from its transaction marker."""
+    """Exact persisted release content and transaction metadata."""
 
     name: str
     body: str
-    generated_body: str
 
 
 class ApiClient:
@@ -286,8 +286,14 @@ def _safe_text(value: str, source: str, *, allow_empty: bool = False) -> str:
 
 
 def _safe_multiline_text(value: str, source: str) -> str:
-    if "\r" in value or any(
-        ord(character) < 32 and character not in {"\n", "\t"} for character in value
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ReleaseOperationError(f"{source} is not valid UTF-8 text") from exc
+    if (
+        "\r" in value
+        or "\x7f" in value
+        or any(ord(character) < 32 and character not in {"\n", "\t"} for character in value)
     ):
         _fail(f"{source} contains unsupported control characters")
     return value
@@ -595,8 +601,8 @@ def verify_remote_source(
         (master_sha, "remote master SHA"),
     ):
         _require_sha(value, label)
-    if object_type not in {"commit", "tag"}:
-        _fail(f"remote release tag points to an unsupported object type: {object_type!r}")
+    if object_type != "tag":
+        _fail("remote release tag must be an annotated tag object, not a lightweight tag")
     if tag_commit_sha != source_sha:
         _fail("current remote release tag peels to a different source commit")
     if expected_tag_object_sha is not None and tag_object_sha != expected_tag_object_sha:
@@ -828,6 +834,25 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _read_release_body(path: Path) -> tuple[str, str]:
+    """Read an exact UTF-8 release body of at most 60 KiB from a regular file."""
+    if path.is_symlink() or not path.is_file():
+        _fail(f"release body is not a regular non-symlink file: {path}")
+    body_bytes = path.read_bytes()
+    if len(body_bytes) > _MAX_RELEASE_BODY_BYTES:
+        _fail("release body exceeds the 60 KiB UTF-8 limit")
+    try:
+        body = body_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ReleaseOperationError("release body is not valid UTF-8") from exc
+    _safe_multiline_text(body, "release body")
+    if not body or body.isspace():
+        _fail("release body is empty or whitespace-only")
+    if _RELEASE_MARKER_PREFIX in body:
+        _fail("release body contains the reserved transaction marker prefix")
+    return body, hashlib.sha256(body_bytes).hexdigest()
+
+
 def _marker_asset_records(local_assets: Iterable[LocalAsset]) -> list[dict[str, object]]:
     return [
         {"name": asset.name, "sha256": asset.sha256, "size": asset.size}
@@ -839,20 +864,18 @@ def _build_release_content(
     *,
     tag: str,
     source_sha: str,
-    curated_segment: str,
-    curated_sha256: str,
-    generated_name: str,
-    generated_body: str,
+    release_body: str,
+    release_body_sha256: str,
     local_assets: tuple[LocalAsset, LocalAsset],
 ) -> ReleaseContent:
-    generated_segment = generated_body.strip("\n")
-    if _RELEASE_MARKER_PREFIX in curated_segment or _RELEASE_MARKER_PREFIX in generated_segment:
-        _fail("release notes contain the reserved transaction marker prefix")
+    if _RELEASE_MARKER_PREFIX in release_body:
+        _fail("release body contains the reserved transaction marker prefix")
+    title = f"archicad-mcp {tag}"
     marker_record: dict[str, object] = {
         "assets": _marker_asset_records(local_assets),
-        "curated_sha256": curated_sha256,
-        "generated_body_sha256": _sha256_text(generated_segment),
-        "generated_title_sha256": _sha256_text(generated_name),
+        "curated_sha256": release_body_sha256,
+        "generated_body_sha256": _sha256_text(""),
+        "generated_title_sha256": _sha256_text(title),
         "schema": 1,
         "source_sha": source_sha,
         "tag": tag,
@@ -866,10 +889,7 @@ def _build_release_content(
     if len(marker_bytes) > _MAX_RELEASE_MARKER_BYTES:
         _fail("release transaction marker is unexpectedly large")
     marker = f"{_RELEASE_MARKER_PREFIX}v1:{marker_bytes.hex()} -->"
-    public_parts = [part for part in (curated_segment, generated_segment) if part]
-    public_body = "\n\n".join(public_parts)
-    exact_body = f"{public_body}\n\n{marker}" if public_body else marker
-    return ReleaseContent(generated_name, exact_body, generated_segment)
+    return ReleaseContent(title, f"{release_body}\n\n{marker}")
 
 
 def _parse_release_content(
@@ -877,8 +897,8 @@ def _parse_release_content(
     *,
     tag: str,
     source_sha: str,
-    curated_segment: str,
-    curated_sha256: str,
+    release_body: str,
+    release_body_sha256: str,
     local_assets: tuple[LocalAsset, LocalAsset],
 ) -> ReleaseContent:
     if release.body.count(_RELEASE_MARKER_PREFIX) != 1:
@@ -947,8 +967,8 @@ def _parse_release_content(
     ):
         if _SHA256.fullmatch(value) is None:
             _fail(f"GitHub release transaction marker has an invalid {label}")
-    if marker_tag != tag or marker_source != source_sha or marker_curated != curated_sha256:
-        _fail("GitHub release transaction marker does not match tag, source, or curated notes")
+    if marker_tag != tag or marker_source != source_sha or marker_curated != release_body_sha256:
+        _fail("GitHub release transaction marker does not match tag, source, or release body")
 
     raw_assets = _json_list(marker.get("assets"), "GitHub release transaction marker.assets")
     marker_assets: list[dict[str, object]] = []
@@ -982,24 +1002,14 @@ def _parse_release_content(
         marker_assets.append({"name": name, "sha256": sha256, "size": size})
     if marker_assets != _marker_asset_records(local_assets):
         _fail("GitHub release transaction marker does not match the retained release assets")
-    if title_hash != _sha256_text(release.name):
-        _fail("GitHub release title does not match its transaction marker")
-
-    if curated_segment:
-        generated_prefix = f"{curated_segment}\n\n"
-        if public_body == curated_segment:
-            generated_segment = ""
-        elif public_body.startswith(generated_prefix):
-            generated_segment = public_body.removeprefix(generated_prefix)
-        else:
-            _fail("GitHub release curated body segment does not match the retained notes")
-    else:
-        generated_segment = public_body
-    if generated_segment != generated_segment.strip("\n"):
-        _fail("GitHub release generated body segment is not canonically delimited")
-    if body_hash != _sha256_text(generated_segment):
-        _fail("GitHub release generated body does not match its transaction marker")
-    return ReleaseContent(release.name, release.body, generated_segment)
+    expected_title = f"archicad-mcp {tag}"
+    if release.name != expected_title or title_hash != _sha256_text(expected_title):
+        _fail("GitHub release title does not match the deterministic title")
+    if body_hash != _sha256_text(""):
+        _fail("GitHub release generated-body marker must hash the empty segment")
+    if public_body != release_body:
+        _fail("GitHub release public body does not match the supplied release body")
+    return ReleaseContent(release.name, release.body)
 
 
 def _validate_release_identity(
@@ -1007,8 +1017,8 @@ def _validate_release_identity(
     *,
     tag: str,
     source_sha: str,
-    curated_segment: str,
-    curated_sha256: str,
+    release_body: str,
+    release_body_sha256: str,
     local_assets: tuple[LocalAsset, LocalAsset],
 ) -> ReleaseContent:
     if release.tag_name != tag:
@@ -1021,8 +1031,8 @@ def _validate_release_identity(
         release,
         tag=tag,
         source_sha=source_sha,
-        curated_segment=curated_segment,
-        curated_sha256=curated_sha256,
+        release_body=release_body,
+        release_body_sha256=release_body_sha256,
         local_assets=local_assets,
     )
 
@@ -1065,30 +1075,6 @@ def _validate_release_assets(
     if require_complete and (uploaded != set(expected) or starters):
         _fail("published GitHub release does not contain exactly the wheel and sdist")
     return ReleaseAssetInventory(frozenset(uploaded), tuple(starters), frozenset(names))
-
-
-def _generate_release_notes(
-    client: ApiClient,
-    *,
-    api_base: str,
-    repository: str,
-    tag: str,
-    source_sha: str,
-) -> tuple[str, str]:
-    url = _github_api_url(api_base, repository, "releases/generate-notes")
-    _, payload = client.json(
-        "POST",
-        url,
-        expected={200},
-        json_body={"tag_name": tag, "target_commitish": source_sha},
-        retry_safe=True,
-    )
-    record = _json_object(payload, "generated release notes response")
-    name = _field(record, "name", str, "generated release notes response")
-    body = _field(record, "body", str, "generated release notes response")
-    _safe_text(name, "generated release name")
-    _safe_multiline_text(body, "generated release body")
-    return name, body
 
 
 def _observe_release(
@@ -1237,7 +1223,7 @@ def transact_github_release(
     dist_dir: Path,
     wheel_name: str,
     sdist_name: str,
-    curated_notes: Path,
+    release_body_file: Path,
     observe_attempts: int = 4,
     observe_delay: float = 1.0,
     sleeper: Callable[[float], None] = time.sleep,
@@ -1250,18 +1236,7 @@ def transact_github_release(
         raise ValueError("invalid release observation retry configuration")
     local_assets = _local_assets(dist_dir, wheel_name, sdist_name)
     expected = {asset.name: asset for asset in local_assets}
-    if not curated_notes.is_file() or curated_notes.is_symlink():
-        _fail(f"curated release notes file is not a regular file: {curated_notes}")
-    curated_bytes = curated_notes.read_bytes()
-    try:
-        curated_body = curated_bytes.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise ReleaseOperationError("curated release notes are not valid UTF-8") from exc
-    _safe_multiline_text(curated_body, "curated release notes")
-    curated_segment = curated_body.strip("\n")
-    curated_sha256 = hashlib.sha256(curated_bytes).hexdigest()
-    if _RELEASE_MARKER_PREFIX in curated_segment:
-        _fail("curated release notes contain the reserved transaction marker prefix")
+    release_body, release_body_sha256 = _read_release_body(release_body_file)
 
     release = _matching_release(
         client,
@@ -1270,20 +1245,11 @@ def transact_github_release(
         tag=tag,
     )
     if release is None:
-        generated_name, generated_body = _generate_release_notes(
-            client,
-            api_base=api_base,
-            repository=repository,
-            tag=tag,
-            source_sha=source_sha,
-        )
         content = _build_release_content(
             tag=tag,
             source_sha=source_sha,
-            curated_segment=curated_segment,
-            curated_sha256=curated_sha256,
-            generated_name=generated_name,
-            generated_body=generated_body,
+            release_body=release_body,
+            release_body_sha256=release_body_sha256,
             local_assets=local_assets,
         )
         create_url = _github_api_url(api_base, repository, "releases")
@@ -1334,8 +1300,8 @@ def transact_github_release(
         release,
         tag=tag,
         source_sha=source_sha,
-        curated_segment=curated_segment,
-        curated_sha256=curated_sha256,
+        release_body=release_body,
+        release_body_sha256=release_body_sha256,
         local_assets=local_assets,
     )
     observed_assets = _release_assets(
@@ -1485,8 +1451,8 @@ def transact_github_release(
         published,
         tag=tag,
         source_sha=source_sha,
-        curated_segment=curated_segment,
-        curated_sha256=curated_sha256,
+        release_body=release_body,
+        release_body_sha256=release_body_sha256,
         local_assets=local_assets,
     )
     final_assets = _release_assets(
@@ -1562,7 +1528,12 @@ def _build_parser() -> argparse.ArgumentParser:
     github_release.add_argument("--dist-dir", required=True, type=Path)
     github_release.add_argument("--wheel", required=True)
     github_release.add_argument("--sdist", required=True)
-    github_release.add_argument("--curated-notes", required=True, type=Path)
+    github_release.add_argument(
+        "--release-body-file",
+        required=True,
+        type=Path,
+        help="regular UTF-8 file containing the complete release body (maximum 60 KiB)",
+    )
     return parser
 
 
@@ -1645,7 +1616,7 @@ def main(argv: list[str] | None = None) -> int:
                 dist_dir=args.dist_dir,
                 wheel_name=args.wheel,
                 sdist_name=args.sdist,
-                curated_notes=args.curated_notes,
+                release_body_file=args.release_body_file,
             )
             sys.stdout.write(f"GitHub release transaction outcome: {outcome}\n")
         else:

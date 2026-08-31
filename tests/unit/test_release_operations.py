@@ -3,8 +3,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import re
 import socket
 import subprocess
+import sys
+import textwrap
 import threading
 import urllib.parse
 import zipfile
@@ -48,9 +52,7 @@ class FakeApiState:
     faults: set[str] = field(default_factory=set)
     requests: list[tuple[str, str, str | None]] = field(default_factory=list)
     mutations: dict[str, int] = field(default_factory=dict)
-    generated_name: str = "archicad-mcp v1.2.3"
-    generated_body: str = "## Generated notes\n"
-    generated_calls: int = 0
+    create_payload: dict[str, object] | None = None
     release_hidden_reads: int = 0
 
 
@@ -146,16 +148,9 @@ class FakeApiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = self._record()
         state = self.server.state
-        if parsed.path.endswith("/releases/generate-notes"):
-            self._json_body()
-            state.generated_calls += 1
-            self._respond_json(
-                200,
-                {"name": state.generated_name, "body": state.generated_body},
-            )
-            return
         if parsed.path.endswith("/releases"):
             payload = self._json_body()
+            state.create_payload = dict(payload)
             state.mutations["create"] = state.mutations.get("create", 0) + 1
             state.release = {
                 "id": 1,
@@ -365,29 +360,203 @@ def test_dispatch_rerun_reuses_artifact_for_workflow_head_not_requested_source(
     assert all(version == "2026-03-10" for _, _, version in fake_api.state.requests)
 
 
-def test_workflow_keeps_dispatch_source_and_workflow_head_independent() -> None:
-    workflow = (
+def _workflow() -> str:
+    return (
         Path(__file__).resolve().parents[2] / ".github" / "workflows" / "release.yml"
     ).read_text(encoding="utf-8")
 
-    assert (
-        "ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}"
-        in workflow
+
+def test_workflow_is_manual_only_with_exact_inputs_and_safe_default() -> None:
+    workflow = _workflow()
+
+    trigger = workflow.split("permissions:", maxsplit=1)[0]
+    assert "workflow_dispatch:" in trigger
+    assert "push:" not in trigger
+    assert re.search(
+        r"mode:\n        description:.*\n        required: true\n        type: choice\n"
+        r"        options:\n          - testpypi\n          - production\n        default: testpypi",
+        trigger,
     )
+    assert re.search(
+        r"ref:\n        description:.*\n        required: true\n        type: string", trigger
+    )
+    assert re.search(
+        r"release_body:\n        description:.*\n        required: false\n        type: string",
+        trigger,
+    )
+
+
+def test_workflow_validates_dispatch_before_checkout_and_uses_master_workflow_ref() -> None:
+    workflow = _workflow()
+
+    validation = workflow.index("- name: Validate dispatch and extract the release body")
+    checkout = workflow.index("- name: Check out the validated source")
+    assert validation < checkout
+    assert 'GITHUB_REF") != "refs/heads/master"' in workflow
+    assert 'mode == "production"' in workflow
+    assert "stable_tag.fullmatch(requested_ref)" in workflow
+    assert 'mode == "testpypi"' in workflow
+    assert "commit_sha.fullmatch(requested_ref)" in workflow
+    assert 'if body != ""' in workflow
+    assert "if not body or body.isspace()" in workflow
+    assert "ref: ${{ steps.dispatch.outputs.requested_ref }}" in workflow
     assert '--expected-workflow-head-sha "${{ github.sha }}"' in workflow
     assert '--expected-workflow-head-sha "${{ steps.source.outputs.source_sha }}"' not in workflow
 
 
+def test_workflow_transports_body_only_through_event_file_and_fixed_temp_file() -> None:
+    workflow = _workflow()
+
+    assert "${{ inputs.release_body }}" not in workflow
+    assert "${{ github.event.inputs.release_body }}" not in workflow
+    assert "RELEASE_BODY:" not in workflow
+    assert "release_body=" not in workflow
+    assert "release-body.md" in workflow
+    assert 'Path(os.environ["GITHUB_EVENT_PATH"])' in workflow
+    assert ".write_bytes(body_bytes)" in workflow
+    assert "Create or resume the exact draft-first GitHub Release" in workflow
+    assert '--release-body-file "$RUNNER_TEMP/release-body.md"' in workflow
+    assert "::" not in "\n".join(
+        line for line in workflow.splitlines() if "release_body" in line.lower()
+    )
+
+
+def _run_dispatch_validation(
+    tmp_path: Path,
+    inputs: dict[str, str],
+    *,
+    workflow_ref: str = "refs/heads/master",
+) -> subprocess.CompletedProcess[str]:
+    workflow = _workflow()
+    inline = workflow.split("python - <<'PY'\n", maxsplit=1)[1].split("\n          PY", maxsplit=1)[
+        0
+    ]
+    script = textwrap.dedent(inline)
+    event_path = tmp_path / "event.json"
+    event_path.write_text(json.dumps({"inputs": inputs}), encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "GITHUB_EVENT_PATH": str(event_path),
+            "GITHUB_OUTPUT": str(tmp_path / "output"),
+            "GITHUB_REF": workflow_ref,
+            "RUNNER_TEMP": str(tmp_path),
+        }
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+
+
+@pytest.mark.parametrize(
+    ("inputs", "workflow_ref"),
+    [
+        ({"mode": "production", "ref": _TAG, "release_body": ""}, "refs/heads/master"),
+        (
+            {"mode": "production", "ref": _TAG, "release_body": " \n\t"},
+            "refs/heads/master",
+        ),
+        (
+            {"mode": "production", "ref": "v1.2", "release_body": "notes"},
+            "refs/heads/master",
+        ),
+        (
+            {"mode": "testpypi", "ref": _HEAD_SHA, "release_body": "notes"},
+            "refs/heads/master",
+        ),
+        (
+            {"mode": "testpypi", "ref": "A" * 40, "release_body": ""},
+            "refs/heads/master",
+        ),
+        (
+            {"mode": "testpypi", "ref": _HEAD_SHA, "release_body": ""},
+            "refs/heads/topic",
+        ),
+    ],
+)
+def test_dispatch_validation_rejects_invalid_mode_ref_body_combinations(
+    tmp_path: Path,
+    inputs: dict[str, str],
+    workflow_ref: str,
+) -> None:
+    result = _run_dispatch_validation(tmp_path, inputs, workflow_ref=workflow_ref)
+
+    assert result.returncode != 0
+    assert not (tmp_path / "release-body.md").exists()
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        {"mode": "testpypi", "ref": _HEAD_SHA},
+        {"mode": "testpypi", "ref": _HEAD_SHA, "release_body": ""},
+        {"mode": "production", "ref": _TAG, "release_body": "\nNotes π\n"},
+    ],
+)
+def test_dispatch_validation_accepts_exact_contract_and_preserves_body(
+    tmp_path: Path,
+    inputs: dict[str, str],
+) -> None:
+    result = _run_dispatch_validation(tmp_path, inputs)
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "release-body.md").read_bytes() == inputs.get("release_body", "").encode()
+    output = _read_output(tmp_path / "output")
+    assert output == {"mode": inputs["mode"], "requested_ref": inputs["ref"]}
+
+
+def test_workflow_bootstraps_annotated_production_source_and_allows_master_to_advance() -> None:
+    workflow = _workflow()
+
+    assert '"+refs/tags/$VALIDATED_REF:$tag_ref"' in workflow
+    assert '"+refs/heads/master:$master_ref"' in workflow
+    assert 'git cat-file -t "$tag_object_sha"' in workflow
+    assert '!= "tag"' in workflow
+    assert 'git merge-base --is-ancestor "$head_sha" "$master_ref"' in workflow
+    assert '"$head_sha" == "$(git rev-parse --verify "$master_ref")"' not in workflow
+
+
+def test_workflow_publication_conditions_use_only_validated_release_kind() -> None:
+    workflow = _workflow()
+
+    assert "if: needs.build.outputs.release_kind == 'testpypi'" in workflow
+    assert workflow.count("if: needs.build.outputs.release_kind == 'production'") == 2
+    assert "if: github.event_name" not in workflow
+    assert "github.ref_type" not in workflow
+    assert "needs:\n      - build\n      - publish-pypi" in workflow
+
+
 def test_workflow_has_two_pinned_publish_uses_and_no_attestation_opt_out() -> None:
-    workflow = (
-        Path(__file__).resolve().parents[2] / ".github" / "workflows" / "release.yml"
-    ).read_text(encoding="utf-8")
+    workflow = _workflow()
 
     publish_use_lines = [line for line in workflow.splitlines() if "gh-action-pypi-publish" in line]
     pinned_use = "uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
     assert len(publish_use_lines) == 2
     assert all(line.strip().startswith(pinned_use) for line in publish_use_lines)
     assert "attestations:" not in workflow
+
+
+def test_workflow_preserves_environments_oidc_concurrency_and_exact_artifact_reuse() -> None:
+    workflow = _workflow()
+
+    assert "group: release-${{ github.workflow }}-${{ inputs.mode }}-${{ inputs.ref }}" in workflow
+    concurrency = workflow.split("concurrency:", maxsplit=1)[1].split("env:", maxsplit=1)[0]
+    assert "release_body" not in concurrency
+    assert "cancel-in-progress: false" in concurrency
+    assert "queue: max" in concurrency
+    assert "name: testpypi" in workflow
+    assert "name: pypi" in workflow
+    assert workflow.count("id-token: write") == 2
+    assert "contents: write" in workflow
+    assert "reuse-run-artifact" in workflow
+    assert "artifact-ids: ${{ needs.build.outputs.artifact_id }}" in workflow
+    assert "digest-mismatch: error" in workflow
+    assert "steps.existing.outputs.found != 'true'" in workflow
 
 
 @pytest.mark.parametrize("corruption", ["multiple", "digest", "head", "expired"])
@@ -621,10 +790,10 @@ def _starter_asset(path: Path, asset_id: int) -> dict[str, object]:
     }
 
 
-def _curated_notes(tmp_path: Path, content: str = "# Curated notes\n") -> Path:
-    notes = tmp_path / "notes.md"
-    notes.write_text(content, encoding="utf-8", newline="\n")
-    return notes
+def _release_body(tmp_path: Path, content: str = "# Complete release body\n") -> Path:
+    body = tmp_path / "release-body.md"
+    body.write_bytes(content.encode("utf-8"))
+    return body
 
 
 def _transact(
@@ -632,7 +801,7 @@ def _transact(
     tmp_path: Path,
     dist: Path,
     *,
-    curated_notes: Path | None = None,
+    release_body_file: Path | None = None,
 ) -> str:
     return transact_github_release(
         _client(),
@@ -644,7 +813,7 @@ def _transact(
         dist_dir=dist,
         wheel_name=_WHEEL,
         sdist_name=_SDIST,
-        curated_notes=curated_notes or _curated_notes(tmp_path),
+        release_body_file=release_body_file or _release_body(tmp_path),
         observe_attempts=2,
         observe_delay=0,
         sleeper=lambda _: None,
@@ -654,7 +823,6 @@ def _transact(
 def _reset_fake_history(fake_api: RunningFakeApi) -> None:
     fake_api.state.mutations.clear()
     fake_api.state.requests.clear()
-    fake_api.state.generated_calls = 0
 
 
 def _seed_exact_release(
@@ -670,36 +838,65 @@ def _seed_exact_release(
     _reset_fake_history(fake_api)
 
 
-def _rewrite_marker(release: dict[str, object], **updates: object) -> None:
+def _marker_payload(release: dict[str, object]) -> dict[str, object]:
     body = cast(str, release["body"])
     prefix = "<!-- archicad-mcp-release-transaction:v1:"
     marker_start = body.rfind(prefix)
     assert marker_start >= 0 and body.endswith(" -->")
-    marker_hex = body[marker_start + len(prefix) : -4]
-    marker = json.loads(bytes.fromhex(marker_hex).decode("utf-8"))
+    marker = json.loads(bytes.fromhex(body[marker_start + len(prefix) : -4]).decode("utf-8"))
     assert isinstance(marker, dict)
+    return cast(dict[str, object], marker)
+
+
+def _rewrite_marker(release: dict[str, object], **updates: object) -> None:
+    body = cast(str, release["body"])
+    prefix = "<!-- archicad-mcp-release-transaction:v1:"
+    marker_start = body.rfind(prefix)
+    marker = _marker_payload(release)
     marker.update(updates)
     encoded = json.dumps(marker, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     release["body"] = f"{body[:marker_start]}{prefix}{encoded.encode().hex()} -->"
 
 
-def test_github_release_no_release_creates_marked_draft_uploads_once_and_publishes(
+def test_github_release_uses_exact_body_deterministic_title_and_marker_v1(
     fake_api: RunningFakeApi,
     tmp_path: Path,
 ) -> None:
     dist = _write_dist(tmp_path)
+    supplied_bytes = "\n## Complete body\n\nUnicode:\tÁrvíztűrő tükörfúrógép\n".encode()
+    body_file = tmp_path / "supplied.md"
+    body_file.write_bytes(supplied_bytes)
 
-    outcome = _transact(fake_api, tmp_path, dist)
+    outcome = _transact(fake_api, tmp_path, dist, release_body_file=body_file)
 
     assert outcome == "published"
     assert fake_api.state.release is not None
-    assert fake_api.state.release["draft"] is False
-    body = cast(str, fake_api.state.release["body"])
-    assert body.startswith("# Curated notes\n\n## Generated notes\n\n")
-    assert body.endswith(" -->")
-    assert body.count("<!-- archicad-mcp-release-transaction:v1:") == 1
+    release = fake_api.state.release
+    assert release["draft"] is False
+    assert release["name"] == "archicad-mcp v1.2.3"
+    stored_body = cast(str, release["body"])
+    marker_start = stored_body.index("<!-- archicad-mcp-release-transaction:v1:")
+    assert stored_body[:marker_start].encode() == supplied_bytes + b"\n\n"
+    assert stored_body.count("<!-- archicad-mcp-release-transaction:v1:") == 1
+    marker = _marker_payload(release)
+    assert marker["schema"] == 1
+    assert marker["tag"] == _TAG
+    assert marker["source_sha"] == _HEAD_SHA
+    assert marker["curated_sha256"] == hashlib.sha256(supplied_bytes).hexdigest()
+    assert marker["generated_body_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert marker["generated_title_sha256"] == hashlib.sha256(b"archicad-mcp v1.2.3").hexdigest()
+    assert marker["assets"] == [
+        {
+            "name": path.name,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "size": path.stat().st_size,
+        }
+        for path in sorted(dist.iterdir(), key=lambda candidate: candidate.name)
+    ]
+    assert fake_api.state.create_payload is not None
+    assert fake_api.state.create_payload["generate_release_notes"] is False
+    assert not any("generate-notes" in path for _, path, _ in fake_api.state.requests)
     assert {asset["name"] for asset in fake_api.state.assets} == {_WHEEL, _SDIST}
-    assert fake_api.state.generated_calls == 1
     assert fake_api.state.mutations == {
         "create": 1,
         f"upload:{_WHEEL}": 1,
@@ -707,6 +904,71 @@ def test_github_release_no_release_creates_marked_draft_uploads_once_and_publish
         "publish": 1,
     }
     assert all(version == "2026-03-10" for _, _, version in fake_api.state.requests)
+
+
+@pytest.mark.parametrize("content", [b"", b" \n\t"])
+def test_release_body_rejects_empty_or_whitespace_only(
+    fake_api: RunningFakeApi,
+    tmp_path: Path,
+    content: bytes,
+) -> None:
+    dist = _write_dist(tmp_path)
+    body_file = tmp_path / "body.md"
+    body_file.write_bytes(content)
+
+    with pytest.raises(ReleaseOperationError, match=r"empty|whitespace"):
+        _transact(fake_api, tmp_path, dist, release_body_file=body_file)
+    assert fake_api.state.mutations == {}
+
+
+@pytest.mark.parametrize("control", ["\x00", "\x01", "\x0b", "\r", "\x7f"])
+def test_release_body_rejects_unsupported_controls(
+    fake_api: RunningFakeApi,
+    tmp_path: Path,
+    control: str,
+) -> None:
+    dist = _write_dist(tmp_path)
+    body_file = _release_body(tmp_path, f"valid{control}text")
+
+    with pytest.raises(ReleaseOperationError, match="control"):
+        _transact(fake_api, tmp_path, dist, release_body_file=body_file)
+    assert fake_api.state.mutations == {}
+
+
+def test_release_body_rejects_reserved_marker_invalid_utf8_and_oversize(
+    fake_api: RunningFakeApi,
+    tmp_path: Path,
+) -> None:
+    dist = _write_dist(tmp_path)
+    body_file = tmp_path / "body.md"
+    cases = [
+        b"text <!-- archicad-mcp-release-transaction: reserved",
+        b"invalid \xed\xa0\x80 surrogate",
+        b"x" * (60 * 1024 + 1),
+    ]
+
+    for content in cases:
+        body_file.write_bytes(content)
+        with pytest.raises(ReleaseOperationError):
+            _transact(fake_api, tmp_path, dist, release_body_file=body_file)
+    assert fake_api.state.mutations == {}
+
+
+def test_release_body_rejects_symlink(
+    fake_api: RunningFakeApi,
+    tmp_path: Path,
+) -> None:
+    dist = _write_dist(tmp_path)
+    target = _release_body(tmp_path)
+    link = tmp_path / "body-link.md"
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    with pytest.raises(ReleaseOperationError, match="non-symlink"):
+        _transact(fake_api, tmp_path, dist, release_body_file=link)
+    assert fake_api.state.mutations == {}
 
 
 def test_github_release_create_response_loss_is_observed_and_resumed(
@@ -718,10 +980,9 @@ def test_github_release_create_response_loss_is_observed_and_resumed(
 
     assert _transact(fake_api, tmp_path, dist) == "published"
     assert fake_api.state.mutations["create"] == 1
-    assert fake_api.state.generated_calls == 1
 
 
-def test_create_response_loss_rerun_reuses_g1_without_generating_g2(
+def test_create_response_loss_rerun_reuses_exact_supplied_content(
     fake_api: RunningFakeApi,
     tmp_path: Path,
 ) -> None:
@@ -731,15 +992,12 @@ def test_create_response_loss_rerun_reuses_g1_without_generating_g2(
     with pytest.raises(AmbiguousMutationError, match="creation was not observable"):
         _transact(fake_api, tmp_path, dist)
     assert fake_api.state.release is not None
-    g1_name = fake_api.state.release["name"]
-    g1_body = fake_api.state.release["body"]
-    fake_api.state.generated_name = "configuration G2 title"
-    fake_api.state.generated_body = "configuration G2 body\n"
+    original_name = fake_api.state.release["name"]
+    original_body = fake_api.state.release["body"]
 
     assert _transact(fake_api, tmp_path, dist) == "published"
-    assert fake_api.state.release["name"] == g1_name
-    assert fake_api.state.release["body"] == g1_body
-    assert fake_api.state.generated_calls == 1
+    assert fake_api.state.release["name"] == original_name
+    assert fake_api.state.release["body"] == original_body
     assert fake_api.state.mutations["create"] == 1
 
 
@@ -755,7 +1013,6 @@ def test_github_release_one_asset_response_loss_is_observed_without_reupload(
     assert _transact(fake_api, tmp_path, dist) == "published"
     assert fake_api.state.mutations.get(f"upload:{_WHEEL}", 0) == 0
     assert fake_api.state.mutations[f"upload:{_SDIST}"] == 1
-    assert fake_api.state.generated_calls == 0
 
 
 def test_github_release_publish_response_loss_is_observed_as_success(
@@ -768,26 +1025,22 @@ def test_github_release_publish_response_loss_is_observed_as_success(
 
     assert _transact(fake_api, tmp_path, dist) == "published"
     assert fake_api.state.mutations["publish"] == 1
-    assert fake_api.state.generated_calls == 0
 
 
-def test_existing_g1_draft_ignores_later_g2_generation_configuration(
+def test_existing_exact_draft_resumes_without_changing_title_or_body(
     fake_api: RunningFakeApi,
     tmp_path: Path,
 ) -> None:
     dist = _write_dist(tmp_path)
     _seed_exact_release(fake_api, tmp_path, dist, draft=True)
     assert fake_api.state.release is not None
-    g1_name = fake_api.state.release["name"]
-    g1_body = fake_api.state.release["body"]
+    original_name = fake_api.state.release["name"]
+    original_body = fake_api.state.release["body"]
     fake_api.state.assets = [_release_asset(dist / _WHEEL, 10)]
-    fake_api.state.generated_name = "configuration G2 title"
-    fake_api.state.generated_body = "configuration G2 body\n"
 
     assert _transact(fake_api, tmp_path, dist) == "published"
-    assert fake_api.state.release["name"] == g1_name
-    assert fake_api.state.release["body"] == g1_body
-    assert fake_api.state.generated_calls == 0
+    assert fake_api.state.release["name"] == original_name
+    assert fake_api.state.release["body"] == original_body
 
 
 def test_exact_published_github_release_is_idempotent_success(
@@ -799,7 +1052,6 @@ def test_exact_published_github_release_is_idempotent_success(
 
     assert _transact(fake_api, tmp_path, dist) == "already-published"
     assert fake_api.state.mutations == {}
-    assert fake_api.state.generated_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -813,10 +1065,12 @@ def test_exact_published_github_release_is_idempotent_success(
         "curated",
         "asset",
         "title",
+        "generated-title",
+        "generated-body",
         "body",
     ],
 )
-def test_existing_release_marker_mismatch_fails_without_generation_or_mutation(
+def test_existing_release_marker_mismatch_fails_without_mutation(
     fake_api: RunningFakeApi,
     tmp_path: Path,
     mismatch: str,
@@ -856,26 +1110,28 @@ def test_existing_release_marker_mismatch_fails_without_generation_or_mutation(
         _rewrite_marker(release, assets=assets)
     elif mismatch == "title":
         release["name"] = "tampered title"
+    elif mismatch == "generated-title":
+        _rewrite_marker(release, generated_title_sha256="0" * 64)
+    elif mismatch == "generated-body":
+        _rewrite_marker(release, generated_body_sha256="0" * 64)
     else:
         release["body"] = f"{body[:marker_start]}tampered\n\n{body[marker_start:]}"
 
     with pytest.raises(ReleaseOperationError, match=r"marker|body|title"):
         _transact(fake_api, tmp_path, dist)
-    assert fake_api.state.generated_calls == 0
     assert fake_api.state.mutations == {}
 
 
-def test_changed_curated_notes_reject_existing_transaction_without_mutation(
+def test_changed_release_body_rejects_existing_transaction_without_mutation(
     fake_api: RunningFakeApi,
     tmp_path: Path,
 ) -> None:
     dist = _write_dist(tmp_path)
     _seed_exact_release(fake_api, tmp_path, dist, draft=True)
-    changed_notes = _curated_notes(tmp_path, "# Changed curated notes\n")
+    changed_body = _release_body(tmp_path, "# Changed complete release body\n")
 
-    with pytest.raises(ReleaseOperationError, match="curated"):
-        _transact(fake_api, tmp_path, dist, curated_notes=changed_notes)
-    assert fake_api.state.generated_calls == 0
+    with pytest.raises(ReleaseOperationError, match="release body"):
+        _transact(fake_api, tmp_path, dist, release_body_file=changed_body)
     assert fake_api.state.mutations == {}
 
 
@@ -889,7 +1145,6 @@ def test_changed_asset_rejects_existing_transaction_marker_without_mutation(
 
     with pytest.raises(ReleaseOperationError, match="transaction marker"):
         _transact(fake_api, tmp_path, dist)
-    assert fake_api.state.generated_calls == 0
     assert fake_api.state.mutations == {}
 
 
@@ -911,7 +1166,6 @@ def test_draft_starter_asset_is_deleted_observed_and_reuploaded(
     assert _transact(fake_api, tmp_path, dist) == "published"
     assert fake_api.state.mutations[f"delete:{_WHEEL}"] == 1
     assert fake_api.state.mutations[f"upload:{_WHEEL}"] == 1
-    assert fake_api.state.generated_calls == 0
     assert all(version == "2026-03-10" for _, _, version in fake_api.state.requests)
 
 
@@ -981,7 +1235,6 @@ def test_malformed_or_ambiguous_starter_assets_are_never_deleted(
     with pytest.raises(ReleaseOperationError):
         _transact(fake_api, tmp_path, dist)
     assert not any(key.startswith("delete:") for key in fake_api.state.mutations)
-    assert fake_api.state.generated_calls == 0
 
 
 def test_published_starter_asset_is_never_deleted(
@@ -1066,16 +1319,9 @@ def _git_fixture(tmp_path: Path) -> GitFixture:
     return GitFixture(remote, author, consumer, source_sha)
 
 
-@pytest.mark.parametrize("annotated", [False, True])
-def test_remote_source_accepts_lightweight_and_annotated_tags(
-    tmp_path: Path,
-    annotated: bool,
-) -> None:
+def test_remote_source_accepts_annotated_tag(tmp_path: Path) -> None:
     fixture = _git_fixture(tmp_path)
-    if annotated:
-        _git(fixture.author, "tag", "-a", _TAG, "-m", "release")
-    else:
-        _git(fixture.author, "tag", _TAG)
+    _git(fixture.author, "tag", "-a", _TAG, "-m", "release")
     _git(fixture.author, "push", "origin", f"refs/tags/{_TAG}")
 
     result = verify_remote_source(
@@ -1085,7 +1331,40 @@ def test_remote_source_accepts_lightweight_and_annotated_tags(
     )
 
     assert result.source_sha == fixture.source_sha
-    assert result.tag_object_type == ("tag" if annotated else "commit")
+    assert result.tag_object_type == "tag"
+
+
+def test_remote_source_rejects_lightweight_tag(tmp_path: Path) -> None:
+    fixture = _git_fixture(tmp_path)
+    _git(fixture.author, "tag", _TAG)
+    _git(fixture.author, "push", "origin", f"refs/tags/{_TAG}")
+
+    with pytest.raises(ReleaseOperationError, match="annotated"):
+        verify_remote_source(
+            fixture.consumer,
+            tag=_TAG,
+            source_sha=fixture.source_sha,
+        )
+
+
+def test_remote_source_allows_master_to_advance(tmp_path: Path) -> None:
+    fixture = _git_fixture(tmp_path)
+    _git(fixture.author, "tag", "-a", _TAG, "-m", "release")
+    _git(fixture.author, "push", "origin", f"refs/tags/{_TAG}")
+    (fixture.author / "source.txt").write_text("second\n", encoding="utf-8")
+    _git(fixture.author, "commit", "-am", "advance master")
+    advanced_master = _git(fixture.author, "rev-parse", "HEAD")
+    _git(fixture.author, "push", "origin", "master")
+
+    result = verify_remote_source(
+        fixture.consumer,
+        tag=_TAG,
+        source_sha=fixture.source_sha,
+    )
+
+    assert result.source_sha == fixture.source_sha
+    assert result.master_sha == advanced_master
+    assert result.master_sha != result.source_sha
 
 
 def test_remote_source_rejects_moved_tag_object(tmp_path: Path) -> None:
@@ -1111,7 +1390,7 @@ def test_remote_source_rejects_moved_tag_object(tmp_path: Path) -> None:
 
 def test_remote_source_rejects_deleted_tag(tmp_path: Path) -> None:
     fixture = _git_fixture(tmp_path)
-    _git(fixture.author, "tag", _TAG)
+    _git(fixture.author, "tag", "-a", _TAG, "-m", "release")
     _git(fixture.author, "push", "origin", f"refs/tags/{_TAG}")
     _git(fixture.author, "push", "origin", f":refs/tags/{_TAG}")
 
@@ -1129,7 +1408,7 @@ def test_remote_source_rejects_tagged_commit_off_master(tmp_path: Path) -> None:
     (fixture.author / "source.txt").write_text("side\n", encoding="utf-8")
     _git(fixture.author, "commit", "-am", "side commit")
     side_sha = _git(fixture.author, "rev-parse", "HEAD")
-    _git(fixture.author, "tag", _TAG)
+    _git(fixture.author, "tag", "-a", _TAG, "-m", "release")
     _git(fixture.author, "push", "origin", f"refs/tags/{_TAG}")
     _git(fixture.consumer, "fetch", "origin", f"refs/tags/{_TAG}")
     _git(fixture.consumer, "checkout", "--detach", side_sha)
