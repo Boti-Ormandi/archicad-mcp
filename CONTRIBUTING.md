@@ -98,7 +98,8 @@ For a TestPyPI rehearsal, dispatch from `master` with `mode=testpypi`, set `ref`
 ### Release retries and recovery
 
 - Never move, replace, or delete a stable release tag.
-- After any possible PyPI or GitHub mutation, rerun all jobs on the same workflow run. This preserves the run ID, retained artifact ID, and exact artifact bytes.
+- After any possible PyPI or GitHub mutation, use **Re-run failed jobs** on the same workflow run (`gh run rerun RUN_ID --failed`). This preserves successful job outputs and retained artifacts while rerunning failed jobs and their downstream dependents, including a previously skipped GitHub Release job.
+- Do not use **Re-run all jobs** for this recovery. A full rerun preserves the run ID, source SHA, and ref, but reruns the build and removes or replaces Actions artifacts from the earlier attempt; it therefore does not preserve the artifact ID or archive digest.
 - Start a new dispatch only when no external mutation could have occurred in the earlier run.
 - If the same run or its artifact has expired after partial publication, stop and reconcile the external PyPI and GitHub state manually. Do not rebuild and continue automatically.
 - A rerun must supply the same body embedded in the original dispatch event. A changed body fails reconciliation against the existing transaction marker without mutating the release.

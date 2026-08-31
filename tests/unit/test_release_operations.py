@@ -541,6 +541,25 @@ def test_workflow_has_two_pinned_publish_uses_and_no_attestation_opt_out() -> No
     assert "attestations:" not in workflow
 
 
+@pytest.mark.parametrize(
+    "step_name",
+    [
+        "Require the exact complete TestPyPI release after bounded retries",
+        "Require the exact complete PyPI release after bounded retries",
+    ],
+)
+def test_workflow_post_publish_reconciliation_uses_two_minute_retry_window(
+    step_name: str,
+) -> None:
+    workflow = _workflow()
+    marker = f"      - name: {step_name}\n"
+
+    assert workflow.count(marker) == 1
+    step = workflow.split(marker, maxsplit=1)[1].split("\n      - name:", maxsplit=1)[0]
+    assert re.findall(r"--attempts\s+\S+", step) == ["--attempts 13"]
+    assert re.findall(r"--retry-delay\s+\S+", step) == ["--retry-delay 10"]
+
+
 def test_workflow_preserves_environments_oidc_concurrency_and_exact_artifact_reuse() -> None:
     workflow = _workflow()
 
@@ -688,7 +707,7 @@ def test_complete_index_needs_no_publish_directory(
 
 
 @pytest.mark.parametrize("mismatch", ["digest", "unexpected", "type"])
-def test_index_mismatch_fails_closed(
+def test_index_mismatch_fails_closed_without_retrying(
     fake_api: RunningFakeApi,
     tmp_path: Path,
     mismatch: str,
@@ -702,6 +721,7 @@ def test_index_mismatch_fails_closed(
     else:
         record["packagetype"] = "sdist"
     fake_api.state.index_sequences = [[record]]
+    sleeps: list[float] = []
 
     with pytest.raises(ReleaseOperationError):
         reconcile_package_index(
@@ -712,9 +732,15 @@ def test_index_mismatch_fails_closed(
             dist_dir=dist,
             wheel_name=_WHEEL,
             sdist_name=_SDIST,
-            publish_dir=tmp_path / "publish",
-            require_complete=False,
+            publish_dir=None,
+            require_complete=True,
+            attempts=13,
+            retry_delay=10,
+            sleeper=sleeps.append,
         )
+
+    assert fake_api.state.index_reads == 1
+    assert sleeps == []
 
 
 def test_post_publish_reconciliation_retries_partial_until_complete(
@@ -724,7 +750,8 @@ def test_post_publish_reconciliation_retries_partial_until_complete(
     dist = _write_dist(tmp_path)
     wheel = _index_file(dist / _WHEEL, "bdist_wheel")
     sdist = _index_file(dist / _SDIST, "sdist")
-    fake_api.state.index_sequences = [[wheel], [wheel], [wheel, sdist]]
+    fake_api.state.index_sequences = [[wheel]] * 12 + [[wheel, sdist]]
+    sleeps: list[float] = []
 
     missing = reconcile_package_index(
         _client(),
@@ -736,13 +763,14 @@ def test_post_publish_reconciliation_retries_partial_until_complete(
         sdist_name=_SDIST,
         publish_dir=None,
         require_complete=True,
-        attempts=3,
-        retry_delay=0,
-        sleeper=lambda _: None,
+        attempts=13,
+        retry_delay=10,
+        sleeper=sleeps.append,
     )
 
     assert missing == ()
-    assert fake_api.state.index_reads == 3
+    assert fake_api.state.index_reads == 13
+    assert sleeps == [10] * 12
 
 
 def test_post_publish_partial_state_fails_after_bounded_retries(
@@ -751,8 +779,9 @@ def test_post_publish_partial_state_fails_after_bounded_retries(
 ) -> None:
     dist = _write_dist(tmp_path)
     fake_api.state.index_sequences = [[_index_file(dist / _WHEEL, "bdist_wheel")]]
+    sleeps: list[float] = []
 
-    with pytest.raises(ReleaseOperationError, match="did not converge"):
+    with pytest.raises(ReleaseOperationError, match="did not converge") as error:
         reconcile_package_index(
             _client(),
             api_base=fake_api.base_url,
@@ -763,10 +792,14 @@ def test_post_publish_partial_state_fails_after_bounded_retries(
             sdist_name=_SDIST,
             publish_dir=None,
             require_complete=True,
-            attempts=3,
-            retry_delay=0,
-            sleeper=lambda _: None,
+            attempts=13,
+            retry_delay=10,
+            sleeper=sleeps.append,
         )
+
+    assert f"missing ['{_SDIST}']" in str(error.value)
+    assert fake_api.state.index_reads == 13
+    assert sleeps == [10] * 12
 
 
 def _release_asset(path: Path, asset_id: int) -> dict[str, object]:
