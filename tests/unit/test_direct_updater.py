@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -536,24 +537,32 @@ async def test_auto_disabled_short_circuits_without_network(
 
 
 async def test_fresh_foreign_lease_blocks_and_stale_lease_is_taken_over(
-    cache_env: Path, packaged: upd.PackagedTapir
+    cache_env: Path,
+    packaged: upd.PackagedTapir,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fresh = cs.CacheLease(id=str(uuid.uuid4()), wall=time.time(), monotonic=time.monotonic())
+    stale_delta = cs.LEASE_STALE_SECONDS + 10
+    now_wall = stale_delta + 1_000.0
+    now_monotonic = cs.LEASE_STALE_SECONDS / 2
+    monkeypatch.setattr(
+        upd,
+        "time",
+        SimpleNamespace(time=lambda: now_wall, monotonic=lambda: now_monotonic),
+    )
+
+    fresh = cs.CacheLease(id=str(uuid.uuid4()), wall=now_wall, monotonic=now_monotonic)
     cs.store_check_state(cs.CheckState(lease=fresh))
     fake = FakeGitHub(routes_for("1.6.0"))
     blocked = await upd.run_update_check(packaged, fetch=fake, manual=True)
     assert blocked.status == "in-flight"
 
-    stale_delta = cs.LEASE_STALE_SECONDS + 10
-    cs.store_check_state(
-        cs.CheckState(
-            lease=cs.CacheLease(
-                id=str(uuid.uuid4()),
-                wall=time.time() - stale_delta,
-                monotonic=time.monotonic() - stale_delta,
-            )
-        )
+    stale = cs.CacheLease(
+        id=str(uuid.uuid4()),
+        wall=now_wall - stale_delta,
+        monotonic=now_monotonic,
     )
+    assert cs.lease_is_stale(stale, now_wall=now_wall, now_monotonic=now_monotonic)
+    cs.store_check_state(cs.CheckState(lease=stale))
     outcome = await upd.run_update_check(packaged, fetch=fake, manual=True)
     assert outcome.status == "updated"
 
