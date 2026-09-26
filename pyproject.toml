@@ -25,7 +25,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "openpyxl>=3.1.0",
     "rapidfuzz>=3.0.0",
-    "filelock>=3.32.2,<4",
+    "filelock>=4.0.4,<5",
 ]
 
 [project.urls]
